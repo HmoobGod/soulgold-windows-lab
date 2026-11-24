@@ -434,17 +434,40 @@ jobs:
           MeasureTree 'sdk-um-x64-libraries' $um (Join-Path $linkDir 'sdk-um-libs.tsv')
           MeasureTree 'sdk-ucrt-x64-libraries' $ucrt (Join-Path $linkDir 'sdk-ucrt-libs.tsv')
         )
-        # Tie every explicit library to exactly one measured manifest row.
+        # Index path identity separately from exact digest and byte-count evidence.
+        $manifestIndexes = [Collections.Generic.List[object]]::new()
+        foreach ($tree in $trees) {
+          $manifestPath = Join-Path $linkDir $tree.manifest
+          Require ((MeasureFile $manifestPath).sha256 -ceq $tree.sha256) "Library manifest changed before indexing: $($tree.manifest)"
+          $index = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+          $lineNumber = 0
+          foreach ($line in Get-Content -LiteralPath $manifestPath -Encoding utf8) {
+            $lineNumber++
+            [string[]]$parts = $line.Split([char]9)
+            Require ($parts.Count -eq 3) "Malformed library manifest row: $($tree.manifest):$lineNumber"
+            Require ($parts[0] -cmatch '\A[0-9a-f]{64}\z' -and $parts[1] -cmatch '\A(0|[1-9][0-9]{0,10})\z') "Malformed library manifest digest or size: $($tree.manifest):$lineNumber"
+            Require ([long]$parts[1] -le 10737418240) "Library manifest size out of bounds: $($tree.manifest):$lineNumber"
+            $relativePath = $parts[2]
+            Require (-not [string]::IsNullOrEmpty($relativePath) -and -not [IO.Path]::IsPathRooted($relativePath) -and $relativePath -notmatch '[\\:\x00-\x1f]|(^|/)(\.{1,2})?(/|$)') "Invalid library manifest path: $($tree.manifest):$lineNumber"
+            Require (-not $index.ContainsKey($relativePath)) "Duplicate Windows library path: $($tree.manifest):$lineNumber path=$relativePath"
+            $index.Add($relativePath,[ordered]@{sha256=$parts[0];bytes=[long]$parts[1];relative=$relativePath;line=$lineNumber})
+          }
+          Require ($index.Count -eq $tree.files -and (MeasureFile $manifestPath).sha256 -ceq $tree.sha256) "Library manifest count or hash changed: $($tree.manifest)"
+          $manifestIndexes.Add([ordered]@{tree=$tree;index=$index})
+        }
         foreach ($row in $explicitLibs) {
-          $hits = @(foreach ($tree in $trees) {
-            $prefix = $tree.root.TrimEnd('\') + '\'
-            if ($row.path.StartsWith($prefix,[StringComparison]::OrdinalIgnoreCase)) {
-              $rel = [IO.Path]::GetRelativePath($tree.root,$row.path).Replace('\','/')
-              $line = "$($row.sha256)`t$($row.bytes)`t$rel"
-              if (@(Get-Content -LiteralPath (Join-Path $linkDir $tree.manifest) | Where-Object { $_ -ceq $line }).Count -eq 1) { $tree.label }
-            }
+          $roots = @(foreach ($entry in $manifestIndexes) {
+            $prefix = $entry.tree.root.TrimEnd('\') + '\'
+            if ($row.path.StartsWith($prefix,[StringComparison]::OrdinalIgnoreCase)) { $entry }
           })
-          Require ($hits.Count -eq 1 -and (MeasureFile $row.path).sha256 -ceq $row.sha256) 'Explicit library not uniquely covered by measured tree'
+          Require ($roots.Count -eq 1) "Explicit library not uniquely covered by measured tree: path=$($row.path) matching_roots=$($roots.Count)"
+          $entry = $roots[0]
+          $rel = [IO.Path]::GetRelativePath($entry.tree.root,$row.path).Replace('\','/')
+          Require ($entry.index.ContainsKey($rel)) "Explicit library missing from manifest: path=$($row.path) manifest=$($entry.tree.manifest) relative=$rel"
+          $hit = $entry.index[$rel]
+          Require ($hit.sha256 -ceq $row.sha256 -and $hit.bytes -eq $row.bytes) "Explicit library manifest fingerprint mismatch: path=$($row.path) manifest=$($entry.tree.manifest):$($hit.line) expected_sha256=$($row.sha256) actual_sha256=$($hit.sha256) expected_bytes=$($row.bytes) actual_bytes=$($hit.bytes)"
+          $actual = MeasureFile $row.path
+          Require ($actual.sha256 -ceq $row.sha256 -and $actual.bytes -eq $row.bytes -and [string]::Equals($actual.path,$row.path,[StringComparison]::OrdinalIgnoreCase)) "Explicit library changed after manifest: path=$($row.path) expected_sha256=$($row.sha256) actual_sha256=$($actual.sha256) expected_bytes=$($row.bytes) actual_bytes=$($actual.bytes) actual_path=$($actual.path)"
         }
         $report = [ordered]@{ schema='sg-link-inventory-v1'; result='LINK_INVENTORY_COLLECTED_REVIEW_REQUIRED'; workflow_commit=$env:GITHUB_SHA; run_id=$env:GITHUB_RUN_ID; run_attempt=$env:GITHUB_RUN_ATTEMPT; mode=$env:SG_MODE; image=$env:ImageVersion; linker=$linker; linker_identity_sha256=$identityHash; libraries=$explicitLibs; trees=$trees; fixture_executed=$false; native_authorized=$false }
         [IO.File]::WriteAllText((Join-Path $linkDir 'link-inventory.json'),($report | ConvertTo-Json -Depth 12),[Text.UTF8Encoding]::new($false))
