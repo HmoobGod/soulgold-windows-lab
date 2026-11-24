@@ -1,0 +1,954 @@
+name: SoulGold job membership diagnostic build only
+'on':
+  workflow_dispatch:
+    inputs:
+      compile_authorization:
+        description: I_AUTHORIZE_ONE_JOB_MEMBERSHIP_DIAGNOSTIC_OBJECT_ONLY_COMPILE
+        required: true
+        type: string
+      link_authorization:
+        description: I_AUTHORIZE_ONE_JOB_MEMBERSHIP_DIAGNOSTIC_LINK_ONLY_NO_EXECUTION
+        required: true
+        type: string
+permissions: {}
+concurrency:
+  group: sg-outer-job-link-only
+  cancel-in-progress: false
+jobs:
+  diagnostic-build-only:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    env:
+      SG_MODE: compile_and_link
+      SG_COMPILE_AUTHORIZATION: ${{ inputs.compile_authorization }}
+      SG_LINK_AUTHORIZATION: ${{ inputs.link_authorization }}
+      SG_LINKER_ID: 8b54c3feca7447448f05c2fe33b1ef4d2369e68e0463168c668b3d81118e9bc0
+      SG_MSVC_LIB_PIN: 82dd8daca5f31f73b576976b0d8e804e6ea9c194a1fd9156ccfc620cbd558230
+      SG_UM_LIB_PIN: f6b9f5728671a701efa2174ce4c0d769093ac6f7627ad1060dd24c352bd89430
+      SG_UCRT_LIB_PIN: 1cc506b7f65e8a773ecf4db9138b66a224619311267f2b5166b0fc6bdeeee719
+    steps:
+    - name: Require separate diagnostic build authorizations
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        Set-StrictMode -Version Latest
+        if ($env:SG_MODE -cne 'compile_and_link' -or $env:SG_COMPILE_AUTHORIZATION -cne 'I_AUTHORIZE_ONE_JOB_MEMBERSHIP_DIAGNOSTIC_OBJECT_ONLY_COMPILE' -or $env:SG_LINK_AUTHORIZATION -cne 'I_AUTHORIZE_ONE_JOB_MEMBERSHIP_DIAGNOSTIC_LINK_ONLY_NO_EXECUTION') { throw 'Two separate diagnostic build authorizations required; no build' }
+        if ($env:GITHUB_REPOSITORY -cne 'HmoobGod/soulgold-windows-lab' -or $env:GITHUB_REF -cne 'refs/heads/main' -or $env:GITHUB_EVENT_NAME -cne 'workflow_dispatch' -or $env:GITHUB_RUN_ATTEMPT -cne '1' -or $env:GITHUB_ACTOR -cne 'HmoobGod' -or $env:GITHUB_TRIGGERING_ACTOR -cne 'HmoobGod' -or $env:GITHUB_WORKFLOW_SHA -cne $env:GITHUB_SHA -or $env:RUNNER_ENVIRONMENT -cne 'github-hosted') { throw 'Owner first-attempt hosted runner required' }
+        if ($env:SG_LINKER_ID -cne '8b54c3feca7447448f05c2fe33b1ef4d2369e68e0463168c668b3d81118e9bc0' -or $env:SG_MSVC_LIB_PIN -cne '82dd8daca5f31f73b576976b0d8e804e6ea9c194a1fd9156ccfc620cbd558230' -or $env:SG_UM_LIB_PIN -cne 'f6b9f5728671a701efa2174ce4c0d769093ac6f7627ad1060dd24c352bd89430' -or $env:SG_UCRT_LIB_PIN -cne '1cc506b7f65e8a773ecf4db9138b66a224619311267f2b5166b0fc6bdeeee719') { throw 'Reviewed pins required; no build' }
+        if ($env:RUNNER_TEMP -cne 'D:\a\_temp') { throw 'Absolute build path drift; no build' }
+        if ($env:ImageVersion -cne '20261116.370.1' -or $env:ImageOS -cne 'win22' -or $env:RUNNER_OS -cne 'Windows' -or $env:RUNNER_ARCH -cne 'X64' -or -not [Environment]::Is64BitProcess -or [Environment]::OSVersion.Version.ToString() -cne '10.0.20348.0' -or $PSVersionTable.PSVersion.ToString() -cne '7.6.10') { throw 'Runner drift; no build' }
+        if ($env:GITHUB_SHA -cnotmatch '^[0-9a-f]{40}$' -or $env:GITHUB_RUN_ID -cnotmatch '^[1-9][0-9]{0,19}$') { throw 'Invalid run identity' }
+    - name: Remeasure and compare exact baseline toolchain
+      shell: pwsh
+      run: |
+        Set-StrictMode -Version Latest
+        $ErrorActionPreference = 'Stop'
+        $ProgressPreference = 'SilentlyContinue'
+        function Require([bool]$condition, [string]$message) {
+          if (-not $condition) { throw $message }
+        }
+        function SafeItem([string]$path, [bool]$directory) {
+          $item = Get-Item -LiteralPath $path -Force
+          Require ($item.PSIsContainer -eq $directory) "Wrong item type: $path"
+          Require (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) "Reparse point refused: $path"
+          return $item
+        }
+        function SafeRoot([string]$path) {
+          $full = [IO.Path]::GetFullPath($path)
+          $cursor = $full
+          while ($null -ne $cursor) {
+            $null = SafeItem $cursor $true
+            $parent = [IO.Directory]::GetParent($cursor)
+            if ($null -eq $parent) { break }
+            $cursor = $parent.FullName
+          }
+          return (SafeItem $full $true).FullName
+        }
+        function MeasureFile([string]$path) {
+          $before = SafeItem $path $false
+          $size = $before.Length
+          $stamp = $before.LastWriteTimeUtc.Ticks
+          $hash = (Get-FileHash -LiteralPath $before.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $after = SafeItem $path $false
+          Require ($after.Length -eq $size -and $after.LastWriteTimeUtc.Ticks -eq $stamp) "File changed during hashing: $path"
+          Require ($hash -cmatch '^[0-9a-f]{64}$') "Invalid hash: $path"
+          return [ordered]@{ path = $after.FullName; bytes = $size; sha256 = $hash }
+        }
+        function AssertX64PE([string]$path) {
+          $stream = [IO.File]::OpenRead($path)
+          try {
+            $reader = [IO.BinaryReader]::new($stream)
+            Require ($stream.Length -ge 64) "Short PE: $path"
+            Require ($reader.ReadUInt16() -eq 0x5A4D) "Missing MZ: $path"
+            $stream.Position = 0x3c
+            $offset = $reader.ReadUInt32()
+            Require ($offset -ge 64 -and [long]$offset + 6 -le $stream.Length) "Invalid PE offset: $path"
+            $stream.Position = $offset
+            Require ($reader.ReadUInt32() -eq 0x4550) "Missing PE signature: $path"
+            Require ($reader.ReadUInt16() -eq 0x8664) "Not x64 PE: $path"
+          } finally { $stream.Dispose() }
+        }
+        function MeasureCritical([string]$path) {
+          $row = MeasureFile $path
+          AssertX64PE $row.path
+          $version = (SafeItem $path $false).VersionInfo
+          $signature = Get-AuthenticodeSignature -LiteralPath $row.path
+          $row['file_version'] = $version.FileVersion
+          $row['product_version'] = $version.ProductVersion
+          $row['file_version_parts'] = @($version.FileMajorPart, $version.FileMinorPart, $version.FileBuildPart, $version.FilePrivatePart)
+          $row['machine'] = 'AMD64'
+          $row['signature_status'] = [string]$signature.Status
+          $row['signature_type'] = [string]$signature.SignatureType
+          $row['signer_subject'] = $null
+          $row['signer_cert_sha256'] = $null
+          $row['timestamp_subject'] = $null
+          $row['timestamp_cert_sha256'] = $null
+          if ($null -ne $signature.SignerCertificate) {
+            $row['signer_subject'] = $signature.SignerCertificate.Subject
+            $row['signer_cert_sha256'] = $signature.SignerCertificate.GetCertHashString([Security.Cryptography.HashAlgorithmName]::SHA256).ToLowerInvariant()
+          }
+          if ($null -ne $signature.TimeStamperCertificate) {
+            $row['timestamp_subject'] = $signature.TimeStamperCertificate.Subject
+            $row['timestamp_cert_sha256'] = $signature.TimeStamperCertificate.GetCertHashString([Security.Cryptography.HashAlgorithmName]::SHA256).ToLowerInvariant()
+          }
+          Require ($row.signature_status -eq 'Valid' -and $null -ne $row.signer_subject -and $row.signer_subject -match '(?:^|,\s*)O=Microsoft Corporation(?:,|$)') "Critical PE signature rejected: $path"
+          Require ($version.FileMajorPart -eq 19 -and $version.FileMinorPart -eq 44) "Critical PE is not version 19.44: $path"
+          Require ((MeasureFile $path).sha256 -ceq $row.sha256) "Critical PE changed during signature inspection: $path"
+          return $row
+        }
+        function MeasureTree([string]$label, [string]$root, [string]$destination) {
+          $root = SafeRoot $root
+          $pending = [Collections.Generic.Stack[string]]::new()
+          $pending.Push($root)
+          $rows = [Collections.Generic.List[string]]::new()
+          $count = 0
+          $dirCount = 0
+          $totalBytes = [long]0
+          while ($pending.Count -gt 0) {
+            $directory = $pending.Pop()
+            $null = SafeItem $directory $true
+            $dirCount++
+            Require ($dirCount -le 100000) "Directory-count bound exceeded: $label"
+            foreach ($item in Get-ChildItem -LiteralPath $directory -Force) {
+              Require (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) "Reparse point refused: $($item.FullName)"
+              if ($item.PSIsContainer) { $pending.Push($item.FullName); continue }
+              $count++
+              Require ($count -le 100000) "File-count bound exceeded: $label"
+              $relative = [IO.Path]::GetRelativePath($root, $item.FullName).Replace('\', '/')
+              Require (-not [IO.Path]::IsPathRooted($relative) -and $relative -notmatch '(^|/)\.\.(/|$)|[\x00-\x1f]') "Invalid relative path: $label"
+              $row = MeasureFile $item.FullName
+              $totalBytes += $row.bytes
+              Require ($totalBytes -le 10737418240) "Byte-count bound exceeded: $label"
+              $rows.Add("$($row.sha256)`t$($row.bytes)`t$relative")
+            }
+          }
+          Require ($count -gt 0) "Empty inventory: $label"
+          [string[]]$lines = $rows.ToArray()
+          [Array]::Sort($lines, [StringComparer]::Ordinal)
+          [IO.File]::WriteAllLines($destination, $lines, [Text.UTF8Encoding]::new($false))
+          return [ordered]@{ label = $label; root = $root; files = $count; bytes = $totalBytes; manifest = [IO.Path]::GetFileName($destination); sha256 = (MeasureFile $destination).sha256 }
+        }
+        Require ($env:SG_MODE -cin @('inventory_only','compile_and_link')) 'Unknown mode'
+        if ($env:SG_MODE -ceq 'inventory_only') {
+          Require ([string]::IsNullOrEmpty($env:SG_COMPILE_AUTHORIZATION) -and [string]::IsNullOrEmpty($env:SG_LINK_AUTHORIZATION)) 'Inventory mode must not carry build authorization'
+          foreach ($pin in @($env:SG_LINKER_ID,$env:SG_MSVC_LIB_PIN,$env:SG_UM_LIB_PIN,$env:SG_UCRT_LIB_PIN)) { Require ([string]::IsNullOrEmpty($pin)) 'Inventory mode must not carry approved pins' }
+        } else {
+          Require ($env:SG_COMPILE_AUTHORIZATION -ceq 'I_AUTHORIZE_ONE_JOB_MEMBERSHIP_DIAGNOSTIC_OBJECT_ONLY_COMPILE' -and $env:SG_LINK_AUTHORIZATION -ceq 'I_AUTHORIZE_ONE_JOB_MEMBERSHIP_DIAGNOSTIC_LINK_ONLY_NO_EXECUTION') 'Both explicit authorizations required'
+          foreach ($pin in @($env:SG_LINKER_ID,$env:SG_MSVC_LIB_PIN,$env:SG_UM_LIB_PIN,$env:SG_UCRT_LIB_PIN)) { Require ($pin -cmatch '^[0-9a-f]{64}$') 'Independently reviewed pin missing or invalid' }
+        }
+        Require ($env:GITHUB_REPOSITORY -ceq 'HmoobGod/soulgold-windows-lab' -and $env:GITHUB_REF -ceq 'refs/heads/main') 'Wrong isolated staging repository or ref'
+        Require ($env:GITHUB_EVENT_NAME -ceq 'workflow_dispatch' -and $env:GITHUB_RUN_ATTEMPT -ceq '1') 'Manual first attempt only; no reruns'
+        Require ($env:GITHUB_ACTOR -ceq 'HmoobGod' -and $env:GITHUB_TRIGGERING_ACTOR -ceq 'HmoobGod') 'Owner dispatch required'
+        Require ($env:GITHUB_WORKFLOW_SHA -ceq $env:GITHUB_SHA) 'Workflow and run commit differ'
+        Require ($env:ImageVersion -ceq '20261116.370.1' -and $env:ImageOS -ceq 'win22') 'Runner image drift; no compile'
+        Require ([Environment]::OSVersion.Version.ToString() -ceq '10.0.20348.0') 'OS build drift; no compile'
+        Require ($PSVersionTable.PSVersion.ToString() -ceq '7.6.10') 'PowerShell version drift; no compile'
+        Require ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') 'Manual dispatch required'
+        Require ($env:RUNNER_OS -eq 'Windows' -and $env:RUNNER_ARCH -eq 'X64') 'Windows x64 runner required'
+        Require ([Environment]::Is64BitProcess -and [Environment]::OSVersion.Version.Build -eq 20348) 'Expected 64-bit Windows Server 2022 build 20348'
+        Require (-not [string]::IsNullOrWhiteSpace($env:ImageVersion) -and $env:ImageOS -eq 'win22') 'Runner image identity missing or unexpected'
+        Require ($env:GITHUB_SHA -cmatch '^[0-9a-f]{40}$' -and $env:GITHUB_RUN_ID -match '^\d+$' -and $env:GITHUB_RUN_ATTEMPT -match '^\d+$') 'Missing run identity'
+        $temp = SafeRoot $env:RUNNER_TEMP
+        $output = Join-Path $temp 'sg-windows-toolchain-inventory'
+        Require (-not (Test-Path -LiteralPath $output)) 'Output directory already exists'
+        $null = New-Item -ItemType Directory -Path $output
+        $output = SafeRoot $output
+        $vsRoot = SafeRoot 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise'
+        $toolsRoot = SafeRoot (Join-Path $vsRoot 'VC\Tools\MSVC')
+        $candidates = @(Get-ChildItem -LiteralPath $toolsRoot -Directory -Force | Where-Object { $_.Name -cmatch '^14\.44\.\d+$' })
+        Require ($candidates.Count -eq 1) 'Exactly one MSVC 14.44 (v143) installation required; no automatic fallback'
+        $toolset = $candidates[0].Name
+        $msvcRoot = SafeRoot $candidates[0].FullName
+        $bin = SafeRoot (Join-Path $msvcRoot 'bin\Hostx64\x64')
+        $msvcInclude = SafeRoot (Join-Path $msvcRoot 'include')
+        $msvcLib = SafeRoot (Join-Path $msvcRoot 'lib\x64')
+        $sdkRoot = SafeRoot 'C:\Program Files (x86)\Windows Kits\10'
+        $kitsRoot = (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots' -Name KitsRoot10).KitsRoot10
+        Require ((SafeRoot $kitsRoot).TrimEnd('\') -ieq $sdkRoot.TrimEnd('\')) 'SDK registry root mismatch'
+        $sdkVersion = '10.0.26100.0'
+        $sdkInclude = SafeRoot (Join-Path $sdkRoot "Include\$sdkVersion")
+        $sdkUmLib = SafeRoot (Join-Path $sdkRoot "Lib\$sdkVersion\um\x64")
+        $sdkUcrtLib = SafeRoot (Join-Path $sdkRoot "Lib\$sdkVersion\ucrt\x64")
+        $critical = @(foreach ($name in @('cl.exe', 'c1xx.dll', 'c2.dll')) { MeasureCritical (Join-Path $bin $name) })
+        $requiredHeaders = @(foreach ($name in @('array','algorithm','cstdint','cstdio','string','vector','cwchar','cstring')) { MeasureFile (Join-Path $msvcInclude $name) })
+        $sdkHeaderRoots = @(foreach ($name in @('um','shared','ucrt')) { SafeRoot (Join-Path $sdkInclude $name) })
+        foreach ($name in @('windows.h','bcrypt.h')) {
+          $hits = @(foreach ($root in $sdkHeaderRoots) { $p = Join-Path $root $name; if (Test-Path -LiteralPath $p -PathType Leaf) { $p } })
+          Require ($hits.Count -eq 1) "Missing or ambiguous SDK header: $name"
+          $requiredHeaders += MeasureFile $hits[0]
+        }
+        $libraries = @(
+          MeasureFile (Join-Path $sdkUmLib 'Kernel32.lib')
+          MeasureFile (Join-Path $sdkUmLib 'Bcrypt.lib')
+          MeasureFile (Join-Path $sdkUcrtLib 'ucrt.lib')
+          MeasureFile (Join-Path $msvcLib 'msvcrt.lib')
+          MeasureFile (Join-Path $msvcLib 'vcruntime.lib')
+          MeasureFile (Join-Path $msvcLib 'msvcprt.lib')
+        )
+        $trees = @(
+          MeasureTree 'msvc-hostx64-targetx64-bin' $bin (Join-Path $output 'msvc-bin.tsv')
+          MeasureTree 'msvc-headers' $msvcInclude (Join-Path $output 'msvc-headers.tsv')
+          MeasureTree 'sdk-headers' $sdkInclude (Join-Path $output 'sdk-headers.tsv')
+        )
+        foreach ($row in $critical + $requiredHeaders + $libraries) {
+          Require ((MeasureFile $row.path).sha256 -ceq $row.sha256) 'Required input changed after inventory'
+        }
+        $report = [ordered]@{
+          schema = 'sg-windows-toolchain-inventory-v1'
+          result = 'INVENTORY_COLLECTED_REVIEW_REQUIRED'
+          compile_authorized = $false
+          native_authorized = $false
+          image_os = $env:ImageOS
+          image_version = $env:ImageVersion
+          windows_version = [Environment]::OSVersion.Version.ToString()
+          architecture = $env:RUNNER_ARCH
+          workflow_commit = $env:GITHUB_SHA
+          run_id = $env:GITHUB_RUN_ID
+          run_attempt = $env:GITHUB_RUN_ATTEMPT
+          observed_utc = [DateTime]::UtcNow.ToString('o')
+          powershell_version = $PSVersionTable.PSVersion.ToString()
+          visual_studio_root = $vsRoot
+          msvc_toolset = $toolset
+          msvc_root = $msvcRoot
+          sdk_root = $sdkRoot
+          sdk_version = $sdkVersion
+          critical_compiler_files = $critical
+          required_headers = $requiredHeaders
+          required_libraries = $libraries
+          inventories = $trees
+          limits = 'Host observations only; no dependency closure, execution, build, or publisher-independent attestation. Header and library bytes were hashed, not signature-validated.'
+        }
+        $reportPath = Join-Path $output 'inventory.json'
+        [IO.File]::WriteAllText($reportPath, ($report | ConvertTo-Json -Depth 12), [Text.UTF8Encoding]::new($false))
+        $reportHash = (MeasureFile $reportPath).sha256
+        Write-Host "INVENTORY_COLLECTED_REVIEW_REQUIRED: MSVC $toolset; SDK $sdkVersion; image $env:ImageVersion"
+        Write-Host "inventory.json SHA256: $reportHash"
+        foreach ($row in $critical) { Write-Host "$($row.sha256) $($row.path) [$($row.file_version)] [$($row.signature_status)]" }
+        foreach ($row in $trees) { Write-Host "$($row.sha256) $($row.manifest) ($($row.files) files)" }
+
+        # Compare against measured run 45310694296 / artifact 14882428319, not public version guesses.
+        $expected = @'
+        {"critical_compiler_files":[{"path":"C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\cl.exe","bytes":677736,"sha256":"e87e78b3ef6580b75aebda843f8a22e874612d9f766344046551399f898eb226","file_version":"19.44.35230.0","product_version":"14.44.35230.0","machine":"AMD64","signature_status":"Valid","signature_type":"Authenticode","signer_subject":"CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US","signer_cert_sha256":"d33927e4dda9b91def9f8ed282549a49217ed8cacf54577a690963cbc5eff3ed","timestamp_subject":"CN=Microsoft Time-Stamp Service, OU=nShield TSS ESN:9600-05E0-D947, OU=Microsoft America Operations, O=Microsoft Corporation, L=Redmond, S=Washington, C=US","timestamp_cert_sha256":"cc325c61674cdb19441aece8637f05b574a2468d3f754162a2c58d4b059db82a"},{"path":"C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\c1xx.dll","bytes":12330336,"sha256":"a9348b973d399e7e042a79be7e22dc054e008381a2ef3d9f394300e41aa47470","file_version":"19.44.35230.0","product_version":"14.44.35230.0","machine":"AMD64","signature_status":"Valid","signature_type":"Authenticode","signer_subject":"CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US","signer_cert_sha256":"c30b441672c82883d92eddac6d24cb57e9960bda4486c7fb5865e74157f35850","timestamp_subject":"CN=Microsoft Time-Stamp Service, OU=nShield TSS ESN:6F1A-05E0-D947, OU=Microsoft Ireland Operations Limited, O=Microsoft Corporation, L=Redmond, S=Washington, C=US","timestamp_cert_sha256":"a0206926361768efe284edd5a123e1360adc7644b5a862fbc9a1d0887221c768"},{"path":"C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\c2.dll","bytes":10456376,"sha256":"e2fdfd6505cd6e9b670922733a914fbf22cae5d226943290548f24eaf699267a","file_version":"19.44.35230.0","product_version":"14.44.35230.0","machine":"AMD64","signature_status":"Valid","signature_type":"Authenticode","signer_subject":"CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US","signer_cert_sha256":"d33927e4dda9b91def9f8ed282549a49217ed8cacf54577a690963cbc5eff3ed","timestamp_subject":"CN=Microsoft Time-Stamp Service, OU=nShield TSS ESN:A935-03E0-D947, OU=Microsoft America Operations, O=Microsoft Corporation, L=Redmond, S=Washington, C=US","timestamp_cert_sha256":"e5e7011a35a1521c38b24a0ea944d1a76afe367d4d77659d7591717193841172"}],"required_headers":[{"path":"C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\VC\\Tools\\MSVC\\14.44.35207\\include\\array","bytes":29292,"sha256":"48d2c6c4926e08d0d96f41e59f69513737f76107530f68c94d5d9fe668689a15"},{"path":"C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\VC\\Tools\\MSVC\\14.44.35207\\include\\algorithm","bytes":533492,"sha256":"e4cfb31da8ec07af89834d829ea72b20c7e3202476af3b0641cfe8d6ebb245d7"},{"path":"C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\VC\\Tools\\MSVC\\14.44.35207\\include\\cstdint","bytes":2674,"sha256":"7e608450751cd44f43942b20e1c1c455d42872e78e7119361316850644f1fb75"},{"path":"C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\VC\\Tools\\MSVC\\14.44.35207\\include\\cstdio","bytes":2511,"sha256":"d13434f976c70f1ea3f930ad63121bfd8cfb5c736cfc48a91f06a7608b1fbaa0"},{"path":"C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\VC\\Tools\\MSVC\\14.44.35207\\include\\string","bytes":16455,"sha256":"dafa5ec4d069f7e85001d6a03fdcac5bde1d18eb7412240aa5cc7e10c7cddf05"},{"path":"C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\VC\\Tools\\MSVC\\14.44.35207\\include\\vector","bytes":161282,"sha256":"351604d91a2ceac79f9bd9448c0553cccc22711e22955b5938eaf41de98334a6"},{"path":"C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\VC\\Tools\\MSVC\\14.44.35207\\include\\cwchar","bytes":3044,"sha256":"6395a6c56a62c4b02e58f4f5bf6904f7baabd7b90d0de281148ee3c115e7291a"},{"path":"C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\VC\\Tools\\MSVC\\14.44.35207\\include\\cstring","bytes":1532,"sha256":"6f16cc44e5505c1d46e0869b8a7cbabf0be1646203261ab6e885165faceb98a6"},{"path":"C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.26100.0\\um\\windows.h","bytes":7511,"sha256":"b337d661d03a4abefb7b86a2742ce1ad5d19b57cd8b858bd13e7bbcc1dbeeaaa"},{"path":"C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.26100.0\\shared\\bcrypt.h","bytes":79906,"sha256":"0cf4c7a0e55aaaeab9bad8f2ab7b2bfdc20da3b51c1ca2c5ad8919529dbc7526"}],"required_libraries":[{"path":"C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.26100.0\\um\\x64\\Kernel32.lib","bytes":311908,"sha256":"842f5ce7ad8cf5aab7491b791e7968d2be510ae93f4019d3311797289399d221"},{"path":"C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.26100.0\\um\\x64\\Bcrypt.lib","bytes":14576,"sha256":"9fe31df255d17b0339391ff80a71bf2c5d442cc301bd2fe6eeea00b626f10785"},{"path":"C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.26100.0\\ucrt\\x64\\ucrt.lib","bytes":285588,"sha256":"7ef4eac926bf597d2f243f16cdfed7e0db22cb3ca34a1d7e088a84c994a03d66"},{"path":"C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\VC\\Tools\\MSVC\\14.44.35207\\lib\\x64\\msvcrt.lib","bytes":8031888,"sha256":"07670951a39739b6d1b50421ae61707ef23c8dff50cdf35f99408711478f3a7c"},{"path":"C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\VC\\Tools\\MSVC\\14.44.35207\\lib\\x64\\vcruntime.lib","bytes":285940,"sha256":"1acbd98b43a4be8373e25c65dcae4412f36f6111d6b64e47e4a2a97a1d16b27b"},{"path":"C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\VC\\Tools\\MSVC\\14.44.35207\\lib\\x64\\msvcprt.lib","bytes":4050616,"sha256":"59d3ab1065f0a14bd9b27debef4008a91eafbc7411290013f61091bf12dfca0f"}],"inventories":[{"label":"msvc-hostx64-targetx64-bin","root":"C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64","files":91,"bytes":98909530,"manifest":"msvc-bin.tsv","sha256":"4e48523901bf17a721ee0f90e023134b06d3b948f233933c8b98f542b0966543"},{"label":"msvc-headers","root":"C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\VC\\Tools\\MSVC\\14.44.35207\\include","files":361,"bytes":16200441,"manifest":"msvc-headers.tsv","sha256":"42c7a97507013d929fda7836abab00acf0ed89374ebf9d4395dccf7ba1db1685"},{"label":"sdk-headers","root":"C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.26100.0","files":5563,"bytes":386817955,"manifest":"sdk-headers.tsv","sha256":"7363646e30aac0d2fc4033e248f6bc294fcb142f9bb89a52121baed27bf0d835"}]}
+        '@ | ConvertFrom-Json -AsHashtable
+        Require ($toolset -ceq '14.44.35207' -and $sdkVersion -ceq '10.0.26100.0') 'Toolset or SDK drift'
+        foreach ($group in @('critical_compiler_files','required_headers','required_libraries','inventories')) {
+          $actualRows = $report[$group]
+          $expectedRows = $expected[$group]
+          Require ($actualRows.Count -eq $expectedRows.Count) "Inventory row count drift: $group"
+          for ($i=0; $i -lt $expectedRows.Count; $i++) {
+            foreach ($key in $expectedRows[$i].Keys) {
+              Require ($actualRows[$i].Contains($key)) "Missing inventory key: $group / $key"
+              Require ([string]$actualRows[$i][$key] -ceq [string]$expectedRows[$i][$key]) "Exact inventory drift: $group / $i / $key"
+            }
+          }
+        }
+        Write-Host 'EXACT_MEASURED_TOOLCHAIN_MATCH: prior toolchain preflight passed; no compiler invoked in this step'
+    - name: Measure linker and complete library roots; require reviewed pins for build
+      shell: pwsh
+      run: |
+        Set-StrictMode -Version Latest
+        $ErrorActionPreference = 'Stop'
+        $ProgressPreference = 'SilentlyContinue'
+        function Require([bool]$condition, [string]$message) {
+          if (-not $condition) { throw $message }
+        }
+        function SafeItem([string]$path, [bool]$directory) {
+          $item = Get-Item -LiteralPath $path -Force
+          Require ($item.PSIsContainer -eq $directory) "Wrong item type: $path"
+          Require (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) "Reparse point refused: $path"
+          return $item
+        }
+        function SafeRoot([string]$path) {
+          $full = [IO.Path]::GetFullPath($path)
+          $cursor = $full
+          while ($null -ne $cursor) {
+            $null = SafeItem $cursor $true
+            $parent = [IO.Directory]::GetParent($cursor)
+            if ($null -eq $parent) { break }
+            $cursor = $parent.FullName
+          }
+          return (SafeItem $full $true).FullName
+        }
+        function MeasureFile([string]$path) {
+          $before = SafeItem $path $false
+          $size = $before.Length
+          $stamp = $before.LastWriteTimeUtc.Ticks
+          $hash = (Get-FileHash -LiteralPath $before.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $after = SafeItem $path $false
+          Require ($after.Length -eq $size -and $after.LastWriteTimeUtc.Ticks -eq $stamp) "File changed during hashing: $path"
+          Require ($hash -cmatch '^[0-9a-f]{64}$') "Invalid hash: $path"
+          return [ordered]@{ path = $after.FullName; bytes = $size; sha256 = $hash }
+        }
+        function AssertX64PE([string]$path) {
+          $stream = [IO.File]::OpenRead($path)
+          try {
+            $reader = [IO.BinaryReader]::new($stream)
+            Require ($stream.Length -ge 64) "Short PE: $path"
+            Require ($reader.ReadUInt16() -eq 0x5A4D) "Missing MZ: $path"
+            $stream.Position = 0x3c
+            $offset = $reader.ReadUInt32()
+            Require ($offset -ge 64 -and [long]$offset + 6 -le $stream.Length) "Invalid PE offset: $path"
+            $stream.Position = $offset
+            Require ($reader.ReadUInt32() -eq 0x4550) "Missing PE signature: $path"
+            Require ($reader.ReadUInt16() -eq 0x8664) "Not x64 PE: $path"
+          } finally { $stream.Dispose() }
+        }
+        function MeasureCritical([string]$path) {
+          $row = MeasureFile $path
+          AssertX64PE $row.path
+          $version = (SafeItem $path $false).VersionInfo
+          $signature = Get-AuthenticodeSignature -LiteralPath $row.path
+          $row['file_version'] = $version.FileVersion
+          $row['product_version'] = $version.ProductVersion
+          $row['file_version_parts'] = @($version.FileMajorPart, $version.FileMinorPart, $version.FileBuildPart, $version.FilePrivatePart)
+          $row['machine'] = 'AMD64'
+          $row['signature_status'] = [string]$signature.Status
+          $row['signature_type'] = [string]$signature.SignatureType
+          $row['signer_subject'] = $null
+          $row['signer_cert_sha256'] = $null
+          $row['timestamp_subject'] = $null
+          $row['timestamp_cert_sha256'] = $null
+          if ($null -ne $signature.SignerCertificate) {
+            $row['signer_subject'] = $signature.SignerCertificate.Subject
+            $row['signer_cert_sha256'] = $signature.SignerCertificate.GetCertHashString([Security.Cryptography.HashAlgorithmName]::SHA256).ToLowerInvariant()
+          }
+          if ($null -ne $signature.TimeStamperCertificate) {
+            $row['timestamp_subject'] = $signature.TimeStamperCertificate.Subject
+            $row['timestamp_cert_sha256'] = $signature.TimeStamperCertificate.GetCertHashString([Security.Cryptography.HashAlgorithmName]::SHA256).ToLowerInvariant()
+          }
+          Require ($row.signature_status -eq 'Valid' -and $null -ne $row.signer_subject -and $row.signer_subject -match '(?:^|,\s*)O=Microsoft Corporation(?:,|$)') "Critical PE signature rejected: $path"
+          Require (-not [string]::IsNullOrWhiteSpace($version.FileVersion) -and -not [string]::IsNullOrWhiteSpace($version.ProductVersion)) "Missing linker version metadata: $path"
+          Require ((MeasureFile $path).sha256 -ceq $row.sha256) "Critical PE changed during signature inspection: $path"
+          return $row
+        }
+        function MeasureTree([string]$label, [string]$root, [string]$destination) {
+          $root = SafeRoot $root
+          $pending = [Collections.Generic.Stack[string]]::new()
+          $pending.Push($root)
+          $rows = [Collections.Generic.List[string]]::new()
+          $count = 0
+          $dirCount = 0
+          $totalBytes = [long]0
+          while ($pending.Count -gt 0) {
+            $directory = $pending.Pop()
+            $null = SafeItem $directory $true
+            $dirCount++
+            Require ($dirCount -le 100000) "Directory-count bound exceeded: $label"
+            foreach ($item in Get-ChildItem -LiteralPath $directory -Force) {
+              Require (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) "Reparse point refused: $($item.FullName)"
+              if ($item.PSIsContainer) { $pending.Push($item.FullName); continue }
+              $count++
+              Require ($count -le 100000) "File-count bound exceeded: $label"
+              $relative = [IO.Path]::GetRelativePath($root, $item.FullName).Replace('\', '/')
+              Require (-not [IO.Path]::IsPathRooted($relative) -and $relative -notmatch '(^|/)\.\.(/|$)|[\x00-\x1f]') "Invalid relative path: $label"
+              $row = MeasureFile $item.FullName
+              $totalBytes += $row.bytes
+              Require ($totalBytes -le 10737418240) "Byte-count bound exceeded: $label"
+              $rows.Add("$($row.sha256)`t$($row.bytes)`t$relative")
+            }
+          }
+          Require ($count -gt 0) "Empty inventory: $label"
+          [string[]]$lines = $rows.ToArray()
+          [Array]::Sort($lines, [StringComparer]::Ordinal)
+          [IO.File]::WriteAllLines($destination, $lines, [Text.UTF8Encoding]::new($false))
+          return [ordered]@{ label = $label; root = $root; files = $count; bytes = $totalBytes; manifest = [IO.Path]::GetFileName($destination); sha256 = (MeasureFile $destination).sha256 }
+        }
+        Require ($env:SG_MODE -cin @('inventory_only','compile_and_link')) 'Unknown mode'
+        if ($env:SG_MODE -ceq 'inventory_only') {
+          Require ([string]::IsNullOrEmpty($env:SG_COMPILE_AUTHORIZATION) -and [string]::IsNullOrEmpty($env:SG_LINK_AUTHORIZATION)) 'Inventory mode must not carry build authorization'
+          foreach ($pin in @($env:SG_LINKER_ID,$env:SG_MSVC_LIB_PIN,$env:SG_UM_LIB_PIN,$env:SG_UCRT_LIB_PIN)) { Require ([string]::IsNullOrEmpty($pin)) 'Inventory mode must not carry approved pins' }
+        } else {
+          Require ($env:SG_COMPILE_AUTHORIZATION -ceq 'I_AUTHORIZE_ONE_JOB_MEMBERSHIP_DIAGNOSTIC_OBJECT_ONLY_COMPILE' -and $env:SG_LINK_AUTHORIZATION -ceq 'I_AUTHORIZE_ONE_JOB_MEMBERSHIP_DIAGNOSTIC_LINK_ONLY_NO_EXECUTION') 'Both explicit authorizations required'
+          foreach ($pin in @($env:SG_LINKER_ID,$env:SG_MSVC_LIB_PIN,$env:SG_UM_LIB_PIN,$env:SG_UCRT_LIB_PIN)) { Require ($pin -cmatch '^[0-9a-f]{64}$') 'Independently reviewed pin missing or invalid' }
+        }
+        Require ($env:GITHUB_REPOSITORY -ceq 'HmoobGod/soulgold-windows-lab' -and $env:GITHUB_REF -ceq 'refs/heads/main' -and $env:GITHUB_EVENT_NAME -ceq 'workflow_dispatch' -and $env:GITHUB_RUN_ATTEMPT -ceq '1' -and $env:GITHUB_ACTOR -ceq 'HmoobGod' -and $env:GITHUB_TRIGGERING_ACTOR -ceq 'HmoobGod' -and $env:GITHUB_WORKFLOW_SHA -ceq $env:GITHUB_SHA) 'Owner first-attempt exact-ref gate failed'
+        Require ($env:ImageVersion -ceq '20261116.370.1' -and $env:ImageOS -ceq 'win22' -and $env:RUNNER_OS -ceq 'Windows' -and $env:RUNNER_ARCH -ceq 'X64' -and [Environment]::Is64BitProcess -and [Environment]::OSVersion.Version.ToString() -ceq '10.0.20348.0' -and $PSVersionTable.PSVersion.ToString() -ceq '7.6.10') 'Runner drift'
+        $msvc = SafeRoot 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207'
+        $bin = SafeRoot (Join-Path $msvc 'bin\Hostx64\x64')
+        $msvcLib = SafeRoot (Join-Path $msvc 'lib\x64')
+        $um = SafeRoot 'C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\um\x64'
+        $ucrt = SafeRoot 'C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\ucrt\x64'
+        $temp = SafeRoot $env:RUNNER_TEMP
+        $preflight = SafeRoot (Join-Path $temp 'sg-windows-toolchain-inventory')
+        $priorReport = Get-Content -LiteralPath (Join-Path $preflight 'inventory.json') -Raw | ConvertFrom-Json -AsHashtable
+        Require ($priorReport.workflow_commit -ceq $env:GITHUB_SHA -and $priorReport.run_id -ceq $env:GITHUB_RUN_ID -and $priorReport.run_attempt -ceq '1' -and $priorReport.native_authorized -eq $false -and $priorReport.compile_authorized -eq $false) 'Prior preflight receipt mismatch'
+        $linker = MeasureCritical (Join-Path $bin 'link.exe')
+        Require ($linker.sha256 -ceq '49a5df25c3182a22684375b1d62a025016deffccea247894fe5ca2c85610c6a6' -and $linker.bytes -eq 3252616 -and $linker.signature_type -ceq 'Authenticode' -and $linker.signer_cert_sha256 -cmatch '^[0-9a-f]{64}$' -and $linker.timestamp_cert_sha256 -cmatch '^[0-9a-f]{64}$') 'Linker identity or signature mismatch'
+        $identityText = $linker | ConvertTo-Json -Depth 8 -Compress
+        $identityHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($identityText))).ToLowerInvariant()
+        $known = @'
+        [{"path":"C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.26100.0\\um\\x64\\Kernel32.lib","bytes":311908,"sha256":"842f5ce7ad8cf5aab7491b791e7968d2be510ae93f4019d3311797289399d221"},{"path":"C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.26100.0\\um\\x64\\Bcrypt.lib","bytes":14576,"sha256":"9fe31df255d17b0339391ff80a71bf2c5d442cc301bd2fe6eeea00b626f10785"},{"path":"C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.26100.0\\ucrt\\x64\\ucrt.lib","bytes":285588,"sha256":"7ef4eac926bf597d2f243f16cdfed7e0db22cb3ca34a1d7e088a84c994a03d66"},{"path":"C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\VC\\Tools\\MSVC\\14.44.35207\\lib\\x64\\msvcrt.lib","bytes":8031888,"sha256":"07670951a39739b6d1b50421ae61707ef23c8dff50cdf35f99408711478f3a7c"},{"path":"C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\VC\\Tools\\MSVC\\14.44.35207\\lib\\x64\\vcruntime.lib","bytes":285940,"sha256":"1acbd98b43a4be8373e25c65dcae4412f36f6111d6b64e47e4a2a97a1d16b27b"},{"path":"C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\VC\\Tools\\MSVC\\14.44.35207\\lib\\x64\\msvcprt.lib","bytes":4050616,"sha256":"59d3ab1065f0a14bd9b27debef4008a91eafbc7411290013f61091bf12dfca0f"}]
+        '@ | ConvertFrom-Json -AsHashtable
+        $explicitLibs = @(foreach ($row in $known) {
+          $actual = MeasureFile $row.path
+          Require ($actual.sha256 -ceq $row.sha256 -and $actual.bytes -eq $row.bytes -and $actual.path -ceq $row.path) 'Previously measured library drift'
+          $actual
+        })
+        $explicitLibs += MeasureFile (Join-Path $msvcLib 'oldnames.lib')
+        Require ($explicitLibs.Count -eq 7) 'Unexpected explicit library count'
+        $linkDir = Join-Path $temp 'sg-link-inventory'
+        Require (-not (Test-Path -LiteralPath $linkDir)) 'Link inventory output exists'
+        $null = New-Item -ItemType Directory -Path $linkDir
+        $linkDir = SafeRoot $linkDir
+        $trees = @(
+          MeasureTree 'msvc-x64-libraries' $msvcLib (Join-Path $linkDir 'msvc-libs.tsv')
+          MeasureTree 'sdk-um-x64-libraries' $um (Join-Path $linkDir 'sdk-um-libs.tsv')
+          MeasureTree 'sdk-ucrt-x64-libraries' $ucrt (Join-Path $linkDir 'sdk-ucrt-libs.tsv')
+        )
+        # Index path identity separately from exact digest and byte-count evidence.
+        $manifestIndexes = [Collections.Generic.List[object]]::new()
+        foreach ($tree in $trees) {
+          $manifestPath = Join-Path $linkDir $tree.manifest
+          Require ((MeasureFile $manifestPath).sha256 -ceq $tree.sha256) "Library manifest changed before indexing: $($tree.manifest)"
+          $index = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+          $lineNumber = 0
+          foreach ($line in Get-Content -LiteralPath $manifestPath -Encoding utf8) {
+            $lineNumber++
+            [string[]]$parts = $line.Split([char]9)
+            Require ($parts.Count -eq 3) "Malformed library manifest row: $($tree.manifest):$lineNumber"
+            Require ($parts[0] -cmatch '\A[0-9a-f]{64}\z' -and $parts[1] -cmatch '\A(0|[1-9][0-9]{0,10})\z') "Malformed library manifest digest or size: $($tree.manifest):$lineNumber"
+            Require ([long]$parts[1] -le 10737418240) "Library manifest size out of bounds: $($tree.manifest):$lineNumber"
+            $relativePath = $parts[2]
+            Require (-not [string]::IsNullOrEmpty($relativePath) -and -not [IO.Path]::IsPathRooted($relativePath) -and $relativePath -notmatch '[\\:\x00-\x1f]|(^|/)(\.{1,2})?(/|$)') "Invalid library manifest path: $($tree.manifest):$lineNumber"
+            Require (-not $index.ContainsKey($relativePath)) "Duplicate Windows library path: $($tree.manifest):$lineNumber path=$relativePath"
+            $index.Add($relativePath,[ordered]@{sha256=$parts[0];bytes=[long]$parts[1];relative=$relativePath;line=$lineNumber})
+          }
+          Require ($index.Count -eq $tree.files -and (MeasureFile $manifestPath).sha256 -ceq $tree.sha256) "Library manifest count or hash changed: $($tree.manifest)"
+          $manifestIndexes.Add([ordered]@{tree=$tree;index=$index})
+        }
+        foreach ($row in $explicitLibs) {
+          $roots = @(foreach ($entry in $manifestIndexes) {
+            $prefix = $entry.tree.root.TrimEnd('\') + '\'
+            if ($row.path.StartsWith($prefix,[StringComparison]::OrdinalIgnoreCase)) { $entry }
+          })
+          Require ($roots.Count -eq 1) "Explicit library not uniquely covered by measured tree: path=$($row.path) matching_roots=$($roots.Count)"
+          $entry = $roots[0]
+          $rel = [IO.Path]::GetRelativePath($entry.tree.root,$row.path).Replace('\','/')
+          Require ($entry.index.ContainsKey($rel)) "Explicit library missing from manifest: path=$($row.path) manifest=$($entry.tree.manifest) relative=$rel"
+          $hit = $entry.index[$rel]
+          Require ($hit.sha256 -ceq $row.sha256 -and $hit.bytes -eq $row.bytes) "Explicit library manifest fingerprint mismatch: path=$($row.path) manifest=$($entry.tree.manifest):$($hit.line) expected_sha256=$($row.sha256) actual_sha256=$($hit.sha256) expected_bytes=$($row.bytes) actual_bytes=$($hit.bytes)"
+          $actual = MeasureFile $row.path
+          Require ($actual.sha256 -ceq $row.sha256 -and $actual.bytes -eq $row.bytes -and [string]::Equals($actual.path,$row.path,[StringComparison]::OrdinalIgnoreCase)) "Explicit library changed after manifest: path=$($row.path) expected_sha256=$($row.sha256) actual_sha256=$($actual.sha256) expected_bytes=$($row.bytes) actual_bytes=$($actual.bytes) actual_path=$($actual.path)"
+        }
+        $report = [ordered]@{ schema='sg-link-inventory-v1'; result='LINK_INVENTORY_COLLECTED_REVIEW_REQUIRED'; workflow_commit=$env:GITHUB_SHA; run_id=$env:GITHUB_RUN_ID; run_attempt=$env:GITHUB_RUN_ATTEMPT; mode=$env:SG_MODE; image=$env:ImageVersion; linker=$linker; linker_identity_sha256=$identityHash; libraries=$explicitLibs; trees=$trees; fixture_executed=$false; native_authorized=$false }
+        [IO.File]::WriteAllText((Join-Path $linkDir 'link-inventory.json'),($report | ConvertTo-Json -Depth 12),[Text.UTF8Encoding]::new($false))
+        Write-Host "LINKER_IDENTITY_SHA256: $identityHash"
+        foreach ($tree in $trees) { Write-Host "$($tree.manifest): $($tree.sha256) ($($tree.files) files)" }
+        if ($env:SG_MODE -ceq 'compile_and_link') {
+          Require ($identityHash -ceq $env:SG_LINKER_ID -and $trees[0].sha256 -ceq $env:SG_MSVC_LIB_PIN -and $trees[1].sha256 -ceq $env:SG_UM_LIB_PIN -and $trees[2].sha256 -ceq $env:SG_UCRT_LIB_PIN) 'Independently reviewed linker/library pins do not match; no compile'
+        }
+    - name: Compile diagnostic object only; never execute
+      shell: pwsh
+      run: |
+        Set-StrictMode -Version Latest
+        $ErrorActionPreference = 'Stop'
+        $ProgressPreference = 'SilentlyContinue'
+        function Require([bool]$condition, [string]$message) { if (-not $condition) { throw $message } }
+        function Hash([string]$path) { return (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() }
+        function SafeDirectory([string]$path) {
+          $cursor = [IO.Path]::GetFullPath($path)
+          $full = $cursor
+          while ($null -ne $cursor) {
+            $item = Get-Item -LiteralPath $cursor -Force
+            Require ($item.PSIsContainer -and (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)) "Unsafe directory: $cursor"
+            $parent = [IO.Directory]::GetParent($cursor)
+            if ($null -eq $parent) { break }
+            $cursor = $parent.FullName
+          }
+          return $full
+        }
+        function FreshDirectory([string]$path) {
+          Require (-not (Test-Path -LiteralPath $path)) "Directory already exists: $path"
+          $null = New-Item -ItemType Directory -Path $path
+          return (SafeDirectory $path)
+        }
+        Require ($env:SG_MODE -ceq 'compile_and_link' -and $env:SG_COMPILE_AUTHORIZATION -ceq 'I_AUTHORIZE_ONE_JOB_MEMBERSHIP_DIAGNOSTIC_OBJECT_ONLY_COMPILE' -and $env:SG_LINK_AUTHORIZATION -ceq 'I_AUTHORIZE_ONE_JOB_MEMBERSHIP_DIAGNOSTIC_LINK_ONLY_NO_EXECUTION') 'Build authorizations missing'
+        Require ($env:GITHUB_REPOSITORY -ceq 'HmoobGod/soulgold-windows-lab' -and $env:GITHUB_REF -ceq 'refs/heads/main') 'Wrong isolated staging repository or ref'
+        Require ($env:GITHUB_EVENT_NAME -ceq 'workflow_dispatch' -and $env:GITHUB_RUN_ATTEMPT -ceq '1') 'Manual first attempt only; no reruns'
+        Require ($env:GITHUB_ACTOR -ceq 'HmoobGod' -and $env:GITHUB_TRIGGERING_ACTOR -ceq 'HmoobGod') 'Owner dispatch required'
+        Require ($env:GITHUB_WORKFLOW_SHA -ceq $env:GITHUB_SHA) 'Workflow and run commit differ'
+        Require ($env:ImageVersion -ceq '20261116.370.1' -and $env:ImageOS -ceq 'win22') 'Runner image drift; no compile'
+        Require ([Environment]::OSVersion.Version.ToString() -ceq '10.0.20348.0') 'OS build drift; no compile'
+        Require ($PSVersionTable.PSVersion.ToString() -ceq '7.6.10') 'PowerShell version drift; no compile'
+
+        Require ($env:RUNNER_OS -ceq 'Windows' -and $env:RUNNER_ARCH -ceq 'X64' -and [Environment]::Is64BitProcess) 'Wrong host architecture'
+        $inventory = SafeDirectory (Join-Path (SafeDirectory $env:RUNNER_TEMP) 'sg-windows-toolchain-inventory')
+        $reportPath = Join-Path $inventory 'inventory.json'
+        $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json -AsHashtable
+        Require ($report.workflow_commit -ceq $env:GITHUB_SHA -and $report.run_id -ceq $env:GITHUB_RUN_ID -and $report.run_attempt -ceq '1') 'Wrong preflight receipt identity'
+        Require ($report.compile_authorized -eq $false -and $report.native_authorized -eq $false -and $report.result -ceq 'INVENTORY_COLLECTED_REVIEW_REQUIRED') 'Unexpected preflight receipt scope'
+        $manifestPins = @{
+          'msvc-bin.tsv' = '4e48523901bf17a721ee0f90e023134b06d3b948f233933c8b98f542b0966543'
+          'msvc-headers.tsv' = '42c7a97507013d929fda7836abab00acf0ed89374ebf9d4395dccf7ba1db1685'
+          'sdk-headers.tsv' = '7363646e30aac0d2fc4033e248f6bc294fcb142f9bb89a52121baed27bf0d835'
+        }
+        foreach ($name in $manifestPins.Keys) { Require ((Hash (Join-Path $inventory $name)) -ceq $manifestPins[$name]) "Manifest drift: $name" }
+        $msvc = SafeDirectory 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207'
+        $bin = SafeDirectory (Join-Path $msvc 'bin\Hostx64\x64')
+        $sdk = SafeDirectory 'C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0'
+        $includeDirs = @((SafeDirectory (Join-Path $msvc 'include')), (SafeDirectory (Join-Path $sdk 'ucrt')), (SafeDirectory (Join-Path $sdk 'shared')), (SafeDirectory (Join-Path $sdk 'um')))
+        $compilerPins = @{
+          'cl.exe' = 'e87e78b3ef6580b75aebda843f8a22e874612d9f766344046551399f898eb226'
+          'c1xx.dll' = 'a9348b973d399e7e042a79be7e22dc054e008381a2ef3d9f394300e41aa47470'
+          'c2.dll' = 'e2fdfd6505cd6e9b670922733a914fbf22cae5d226943290548f24eaf699267a'
+        }
+        function AssertCompilerPins {
+          foreach ($name in $compilerPins.Keys) {
+            $path = Join-Path $bin $name
+            $item = Get-Item -LiteralPath $path -Force
+            Require (-not $item.PSIsContainer -and (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)) "Unsafe compiler file: $name"
+            Require ((Hash $path) -ceq $compilerPins[$name]) "Compiler drift: $name"
+          }
+        }
+        AssertCompilerPins
+        $base = FreshDirectory (Join-Path $env:RUNNER_TEMP 'sg-outer-job-compile-only')
+        $protected = FreshDirectory (Join-Path $base 'protected')
+        $work = FreshDirectory (Join-Path $base 'work')
+        $compilerTemp = FreshDirectory (Join-Path $base 'compiler-temp')
+        $receiptDir = FreshDirectory (Join-Path $base 'receipt')
+        $source = Join-Path $protected 'job_membership_probe.cpp'
+        $copy = Join-Path $work 'job_membership_probe.cpp'
+        $obj = Join-Path $work 'job_membership_probe.obj'
+        # Embedded exact original source, compressed only to keep each Actions run step bounded.
+        $payload = @'
+        H4sIAAAAAAAC/5VU227bRhB951dMY6SgAFl2HCAtLMuGLbMJA4UsJAtu0RbEmhyJ25C77F6suEn+vbMrhqTRpHD5wMtweObMmTk8OoKVtCrHQymqByg42wqpDc8hZ6LgBTM4gUQaMCXC1jJFGWIKQkIuhWFc1CgMMGtKqfjfzHApJsEBKiUVXMeXr5N0dRPPs1W6Xs6jLE0Wv2Zv0sV1liVpdrWO6S5dZtEv0Xx9E6dJcFDghguE2zh5eZItossku0yus3d0ExxwkVe2QDjbcVHInZ6U54Ngrk3B5XkQcCJUE7NwBB8DoIOYaoMfGmJ0my6vqbOG5dw8wAxenvzw6sepz9KGubZ3eclUZqBhpvztS+YfHz/vk1ZoFkybyPUXRsslkV+t5/NotRpN+1ptHQeR5dISnxm8RvNOFrbCn3iFCavxNhS2qhqjxj5x3NH6FtJe1BmEQ9wZHMOnT8NS57MeyQO548LV75mP4BQesZ8GPvXoCGJRYIN0Iii8RwG7kk5u+rWn70vBXxbVA2wY9VLQflCiAqMsEZbWNJYuwr+1Cice+SpNF8BF9qe8oxZuluto2OUbGvIiAo3VZi/V3CpFDH5WMketw9H/Ut/X8gwz+Z7wYt3ixOKtvAtdlTF04n+/Z/UV1Snaid7BXTwWjoR8rOwQxgrNtwILqLG+Q6VL3jyGCltFLuCFJaRj6wZzYvtpXNFICwIQtkZF21mjYeRJBs6tzph+HHoMJbm1Qg1EFsU9V3JvzHtWWYpizY2hSQ24OZfslAsL4kTeOT1tFAU3Ybc0z3ReYs1mentIJA/7Jg7vX0DDi9nzyrab1y7cIOJ2sX/0MvpHJ6p8P3tue3l9vEend7+LZ+OOxt6YVEObs07RSortefivTYmLcDR60qedR8b/ldX38jTUvlnCHQy6He+TMDpdCKJXpV0svoHwy9jOWvP74W02ldVlSPfkwBF8R+9GoNBYJeBk/237dDx1m7XEXKqCTMuEbqQyfqPIFt7Kw3+7trlT1m/WB8yt+8UDaxolabkmwefgH+U5GoRDBgAA
+        '@
+        $packed = [Convert]::FromBase64String($payload)
+        $memory = [IO.MemoryStream]::new($packed)
+        $gzip = [IO.Compression.GZipStream]::new($memory,[IO.Compression.CompressionMode]::Decompress)
+        try {
+          $originalBytes = [byte[]]::new(1603)
+          $offset = 0
+          while ($offset -lt $originalBytes.Length) {
+            $read = $gzip.Read($originalBytes,$offset,$originalBytes.Length-$offset)
+            Require ($read -gt 0) 'Embedded source truncated'
+            $offset += $read
+          }
+          Require ($gzip.ReadByte() -eq -1) 'Embedded source exceeds exact length'
+        } finally { $gzip.Dispose(); $memory.Dispose() }
+        [IO.File]::WriteAllBytes($source,$originalBytes)
+        $sourceHash = '2afaba1e01936b67339c46e8c2eb7e8387f9e46a2ac5ebe6b5a3b2e504673321'
+        Require ((Hash $source) -ceq $sourceHash) 'Approved source mismatch'
+        $utf8 = [Text.UTF8Encoding]::new($false,$true)
+        $originalText = $utf8.GetString($originalBytes)
+        $barrier = "#error DIAGNOSTIC_SOURCE_ONLY_HOLD__NO_BUILD_OR_EXECUTION`n"
+        $replacement = "// DISPOSABLE_DIAGNOSTIC_BUILD_ONLY_AUTHORIZED__NO_EXECUTION`n"
+        Require ($originalText.Split("`n")[1] + "`n" -ceq $barrier) 'Unconditional line-two barrier missing'
+        Require ([regex]::Matches($originalText,[regex]::Escape($barrier)).Count -eq 1) 'Barrier occurrence count mismatch'
+        # Only this authorized disposable copy receives the one-line substitution.
+        [IO.File]::WriteAllBytes($copy,$utf8.GetBytes($originalText.Replace($barrier,$replacement)))
+        $copyHash = 'aa2475bfb81acbe1ebfe670009a6f704009fb867b4cf1e219dc7b9f02af4f46a'
+        Require ((Hash $copy) -ceq $copyHash -and (Hash $source) -ceq $sourceHash) 'Disposable transformation or protected source mismatch'
+        Require (@(Get-ChildItem -LiteralPath $work -Force).Count -eq 1 -and -not (Test-Path -LiteralPath $obj)) 'Nonempty compile working directory'
+        $windows = SafeDirectory 'C:\Windows'
+        $system32 = SafeDirectory (Join-Path $windows 'System32')
+        Require ($env:SystemRoot -ieq $windows) 'Windows root mismatch'
+        # Restrict search paths; Windows system modules remain part of the trusted hosted image.
+        $psi = [Diagnostics.ProcessStartInfo]::new()
+        $psi.FileName = Join-Path $bin 'cl.exe'
+        $psi.WorkingDirectory = $work
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.Environment.Clear()
+        $psi.Environment['SystemRoot'] = $windows
+        $psi.Environment['WINDIR'] = $windows
+        $psi.Environment['SystemDrive'] = 'C:'
+        $psi.Environment['PATH'] = "$bin;$system32"
+        $psi.Environment['TEMP'] = $compilerTemp
+        $psi.Environment['TMP'] = $compilerTemp
+        $arguments = @('/nologo','/c','/std:c++17','/EHsc','/W4','/WX','/permissive-','/MD','/X','/Y-','/Zc:__cplusplus','/Brepro','/D_WIN32_WINNT=0x0A00','/DWINVER=0x0A00')
+        foreach ($directory in $includeDirs) { $arguments += "/I$directory" }
+        $arguments += @("/Fo$obj",$copy)
+        $expectedCompileArguments = @('/nologo','/c','/std:c++17','/EHsc','/W4','/WX','/permissive-','/MD','/X','/Y-','/Zc:__cplusplus','/Brepro','/D_WIN32_WINNT=0x0A00','/DWINVER=0x0A00','/IC:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\include','/IC:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\ucrt','/IC:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared','/IC:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um','/FoD:\a\_temp\sg-outer-job-compile-only\work\job_membership_probe.obj','D:\a\_temp\sg-outer-job-compile-only\work\job_membership_probe.cpp')
+        Require ($arguments.Count -eq $expectedCompileArguments.Count) 'Argument count drift; no build'
+        for ($i=0;$i -lt $arguments.Count;$i++) { Require ($arguments[$i] -ceq $expectedCompileArguments[$i]) 'Argument drift; no build' }
+        foreach ($arg in $arguments) { $psi.ArgumentList.Add($arg) }
+        Require ($psi.ArgumentList.Contains('/c') -and -not $psi.Environment.ContainsKey('CL') -and -not $psi.Environment.ContainsKey('_CL_') -and -not $psi.Environment.ContainsKey('INCLUDE') -and -not $psi.Environment.ContainsKey('LIB')) 'Object-only/environment gate failed'
+        AssertCompilerPins
+        Require ((Hash $copy) -ceq $copyHash -and (Hash $source) -ceq $sourceHash) 'Source changed before compile'
+        $process = [Diagnostics.Process]::new()
+        $process.StartInfo = $psi
+        try {
+          Require ($process.Start()) 'Compiler process start failed'
+          $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+          $stderrTask = $process.StandardError.ReadToEndAsync()
+          if (-not $process.WaitForExit(120000)) {
+            try { $process.Kill($true) } catch { Write-Host 'Compiler kill failed; runner teardown required' }
+            throw 'Compiler timeout: no successful receipt'
+          }
+          Require ($stdoutTask.Wait(5000) -and $stderrTask.Wait(5000)) 'Compiler output stream timeout'
+          $stdout = $stdoutTask.Result
+          $stderr = $stderrTask.Result
+          $exitCode = $process.ExitCode
+        } finally { $process.Dispose() }
+        [IO.File]::WriteAllText((Join-Path $receiptDir 'compiler-diagnostics.txt'),("STDOUT`n$stdout`nSTDERR`n$stderr"),$utf8)
+        Write-Host $stdout
+        Write-Host $stderr
+        Require ([string]::IsNullOrWhiteSpace($stderr) -and $stdout -notmatch '(?im)\b(?:warning|error)\b') 'Unexpected tool diagnostic'
+        Require ($exitCode -eq 0) "Compiler failed with exit code $exitCode; no successful receipt"
+        AssertCompilerPins
+        Require ((Hash $source) -ceq $sourceHash -and (Hash $copy) -ceq $copyHash) 'Source changed during compilation'
+        $files = @(Get-ChildItem -LiteralPath $work -Force)
+        Require ($files.Count -eq 2 -and @($files | Where-Object { $_.PSIsContainer -or (($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or $_.Name -notin @('job_membership_probe.cpp','job_membership_probe.obj') }).Count -eq 0) 'Unexpected compile output'
+        $objectBytes = [IO.File]::ReadAllBytes($obj)
+        Require ($objectBytes.Length -ge 20 -and $objectBytes.Length -le 10485760) 'Invalid object size'
+        Require ([BitConverter]::ToUInt16($objectBytes,0) -eq 0x8664 -and [BitConverter]::ToUInt16($objectBytes,2) -gt 0 -and [BitConverter]::ToUInt16($objectBytes,16) -eq 0) 'Expected ordinary AMD64 COFF object, not PE image'
+        $receipt = [ordered]@{
+          schema = 'sg-job-membership-compile-only-v1'
+          result = 'OBJECT_ONLY_COMPILED_REVIEW_REQUIRED'
+          workflow_commit = $env:GITHUB_SHA; run_id = $env:GITHUB_RUN_ID; run_attempt = $env:GITHUB_RUN_ATTEMPT
+          baseline_inventory_run = '45310694296'; baseline_inventory_artifact = '14882428319'
+          image_version = $env:ImageVersion; toolset = '14.44.35207'; sdk = '10.0.26100.0'
+          preflight_report_sha256 = (Hash $reportPath); compiler_sha256 = $compilerPins['cl.exe']; source_sha256 = $sourceHash; disposable_source_sha256 = $copyHash
+          arguments = $arguments; compiler_exit_code = $exitCode; object_sha256 = (Hash $obj); object_bytes = $objectBytes.Length
+          object_exported = $false; linked = $false; fixture_executed = $false; diagnostic_executed = $false; execution_fingerprint_approved = $false; containment_approved = $false; native_authorized = $false; gameplay_acceptance = '0/20'
+          dependency_scope = 'Measured compiler directory and explicit header roots; trusted Windows loader/system modules not independently pinned'
+        }
+        [IO.File]::WriteAllText((Join-Path $receiptDir 'compile-receipt.json'),($receipt | ConvertTo-Json -Depth 8),$utf8)
+        Write-Host "OBJECT_ONLY_COMPILED_REVIEW_REQUIRED: $($receipt.object_sha256)"
+    - name: Link diagnostic only; never execute
+      shell: pwsh
+      run: |
+        Set-StrictMode -Version Latest
+        $ErrorActionPreference = 'Stop'
+        $ProgressPreference = 'SilentlyContinue'
+        function Require([bool]$condition, [string]$message) {
+          if (-not $condition) { throw $message }
+        }
+        function SafeItem([string]$path, [bool]$directory) {
+          $item = Get-Item -LiteralPath $path -Force
+          Require ($item.PSIsContainer -eq $directory) "Wrong item type: $path"
+          Require (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) "Reparse point refused: $path"
+          return $item
+        }
+        function SafeRoot([string]$path) {
+          $full = [IO.Path]::GetFullPath($path)
+          $cursor = $full
+          while ($null -ne $cursor) {
+            $null = SafeItem $cursor $true
+            $parent = [IO.Directory]::GetParent($cursor)
+            if ($null -eq $parent) { break }
+            $cursor = $parent.FullName
+          }
+          return (SafeItem $full $true).FullName
+        }
+        function MeasureFile([string]$path) {
+          $before = SafeItem $path $false
+          $size = $before.Length
+          $stamp = $before.LastWriteTimeUtc.Ticks
+          $hash = (Get-FileHash -LiteralPath $before.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $after = SafeItem $path $false
+          Require ($after.Length -eq $size -and $after.LastWriteTimeUtc.Ticks -eq $stamp) "File changed during hashing: $path"
+          Require ($hash -cmatch '^[0-9a-f]{64}$') "Invalid hash: $path"
+          return [ordered]@{ path = $after.FullName; bytes = $size; sha256 = $hash }
+        }
+        function AssertX64PE([string]$path) {
+          $stream = [IO.File]::OpenRead($path)
+          try {
+            $reader = [IO.BinaryReader]::new($stream)
+            Require ($stream.Length -ge 64) "Short PE: $path"
+            Require ($reader.ReadUInt16() -eq 0x5A4D) "Missing MZ: $path"
+            $stream.Position = 0x3c
+            $offset = $reader.ReadUInt32()
+            Require ($offset -ge 64 -and [long]$offset + 6 -le $stream.Length) "Invalid PE offset: $path"
+            $stream.Position = $offset
+            Require ($reader.ReadUInt32() -eq 0x4550) "Missing PE signature: $path"
+            Require ($reader.ReadUInt16() -eq 0x8664) "Not x64 PE: $path"
+          } finally { $stream.Dispose() }
+        }
+        function MeasureCritical([string]$path) {
+          $row = MeasureFile $path
+          AssertX64PE $row.path
+          $version = (SafeItem $path $false).VersionInfo
+          $signature = Get-AuthenticodeSignature -LiteralPath $row.path
+          $row['file_version'] = $version.FileVersion
+          $row['product_version'] = $version.ProductVersion
+          $row['file_version_parts'] = @($version.FileMajorPart, $version.FileMinorPart, $version.FileBuildPart, $version.FilePrivatePart)
+          $row['machine'] = 'AMD64'
+          $row['signature_status'] = [string]$signature.Status
+          $row['signature_type'] = [string]$signature.SignatureType
+          $row['signer_subject'] = $null
+          $row['signer_cert_sha256'] = $null
+          $row['timestamp_subject'] = $null
+          $row['timestamp_cert_sha256'] = $null
+          if ($null -ne $signature.SignerCertificate) {
+            $row['signer_subject'] = $signature.SignerCertificate.Subject
+            $row['signer_cert_sha256'] = $signature.SignerCertificate.GetCertHashString([Security.Cryptography.HashAlgorithmName]::SHA256).ToLowerInvariant()
+          }
+          if ($null -ne $signature.TimeStamperCertificate) {
+            $row['timestamp_subject'] = $signature.TimeStamperCertificate.Subject
+            $row['timestamp_cert_sha256'] = $signature.TimeStamperCertificate.GetCertHashString([Security.Cryptography.HashAlgorithmName]::SHA256).ToLowerInvariant()
+          }
+          Require ($row.signature_status -eq 'Valid' -and $null -ne $row.signer_subject -and $row.signer_subject -match '(?:^|,\s*)O=Microsoft Corporation(?:,|$)') "Critical PE signature rejected: $path"
+          Require (-not [string]::IsNullOrWhiteSpace($version.FileVersion) -and -not [string]::IsNullOrWhiteSpace($version.ProductVersion)) "Missing linker version metadata: $path"
+          Require ((MeasureFile $path).sha256 -ceq $row.sha256) "Critical PE changed during signature inspection: $path"
+          return $row
+        }
+        function MeasureTree([string]$label, [string]$root, [string]$destination) {
+          $root = SafeRoot $root
+          $pending = [Collections.Generic.Stack[string]]::new()
+          $pending.Push($root)
+          $rows = [Collections.Generic.List[string]]::new()
+          $count = 0
+          $dirCount = 0
+          $totalBytes = [long]0
+          while ($pending.Count -gt 0) {
+            $directory = $pending.Pop()
+            $null = SafeItem $directory $true
+            $dirCount++
+            Require ($dirCount -le 100000) "Directory-count bound exceeded: $label"
+            foreach ($item in Get-ChildItem -LiteralPath $directory -Force) {
+              Require (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) "Reparse point refused: $($item.FullName)"
+              if ($item.PSIsContainer) { $pending.Push($item.FullName); continue }
+              $count++
+              Require ($count -le 100000) "File-count bound exceeded: $label"
+              $relative = [IO.Path]::GetRelativePath($root, $item.FullName).Replace('\', '/')
+              Require (-not [IO.Path]::IsPathRooted($relative) -and $relative -notmatch '(^|/)\.\.(/|$)|[\x00-\x1f]') "Invalid relative path: $label"
+              $row = MeasureFile $item.FullName
+              $totalBytes += $row.bytes
+              Require ($totalBytes -le 10737418240) "Byte-count bound exceeded: $label"
+              $rows.Add("$($row.sha256)`t$($row.bytes)`t$relative")
+            }
+          }
+          Require ($count -gt 0) "Empty inventory: $label"
+          [string[]]$lines = $rows.ToArray()
+          [Array]::Sort($lines, [StringComparer]::Ordinal)
+          [IO.File]::WriteAllLines($destination, $lines, [Text.UTF8Encoding]::new($false))
+          return [ordered]@{ label = $label; root = $root; files = $count; bytes = $totalBytes; manifest = [IO.Path]::GetFileName($destination); sha256 = (MeasureFile $destination).sha256 }
+        }
+        Require ($env:SG_MODE -ceq 'compile_and_link' -and $env:SG_COMPILE_AUTHORIZATION -ceq 'I_AUTHORIZE_ONE_JOB_MEMBERSHIP_DIAGNOSTIC_OBJECT_ONLY_COMPILE' -and $env:SG_LINK_AUTHORIZATION -ceq 'I_AUTHORIZE_ONE_JOB_MEMBERSHIP_DIAGNOSTIC_LINK_ONLY_NO_EXECUTION') 'Build authorizations missing'
+        Require ($env:GITHUB_REPOSITORY -ceq 'HmoobGod/soulgold-windows-lab' -and $env:GITHUB_REF -ceq 'refs/heads/main' -and $env:GITHUB_EVENT_NAME -ceq 'workflow_dispatch' -and $env:GITHUB_RUN_ATTEMPT -ceq '1' -and $env:GITHUB_ACTOR -ceq 'HmoobGod' -and $env:GITHUB_TRIGGERING_ACTOR -ceq 'HmoobGod' -and $env:GITHUB_WORKFLOW_SHA -ceq $env:GITHUB_SHA) 'Owner first-attempt exact-ref gate failed'
+        Require ($env:ImageVersion -ceq '20261116.370.1' -and $env:ImageOS -ceq 'win22' -and $env:RUNNER_OS -ceq 'Windows' -and $env:RUNNER_ARCH -ceq 'X64' -and [Environment]::Is64BitProcess -and [Environment]::OSVersion.Version.ToString() -ceq '10.0.20348.0' -and $PSVersionTable.PSVersion.ToString() -ceq '7.6.10') 'Runner drift'
+        $msvc = SafeRoot 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207'
+        $bin = SafeRoot (Join-Path $msvc 'bin\Hostx64\x64')
+        $msvcLib = SafeRoot (Join-Path $msvc 'lib\x64')
+        $um = SafeRoot 'C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\um\x64'
+        $ucrt = SafeRoot 'C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\ucrt\x64'
+        $temp = SafeRoot $env:RUNNER_TEMP
+        $preflight = SafeRoot (Join-Path $temp 'sg-windows-toolchain-inventory')
+        $priorReport = Get-Content -LiteralPath (Join-Path $preflight 'inventory.json') -Raw | ConvertFrom-Json -AsHashtable
+        Require ($priorReport.workflow_commit -ceq $env:GITHUB_SHA -and $priorReport.run_id -ceq $env:GITHUB_RUN_ID -and $priorReport.run_attempt -ceq '1' -and $priorReport.native_authorized -eq $false -and $priorReport.compile_authorized -eq $false) 'Prior preflight receipt mismatch'
+        $linker = MeasureCritical (Join-Path $bin 'link.exe')
+        Require ($linker.sha256 -ceq '49a5df25c3182a22684375b1d62a025016deffccea247894fe5ca2c85610c6a6' -and $linker.bytes -eq 3252616 -and $linker.signature_type -ceq 'Authenticode' -and $linker.signer_cert_sha256 -cmatch '^[0-9a-f]{64}$' -and $linker.timestamp_cert_sha256 -cmatch '^[0-9a-f]{64}$') 'Linker identity or signature mismatch'
+        $identityText = $linker | ConvertTo-Json -Depth 8 -Compress
+        $identityHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($identityText))).ToLowerInvariant()
+        $known = @'
+        [{"path":"C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.26100.0\\um\\x64\\Kernel32.lib","bytes":311908,"sha256":"842f5ce7ad8cf5aab7491b791e7968d2be510ae93f4019d3311797289399d221"},{"path":"C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.26100.0\\um\\x64\\Bcrypt.lib","bytes":14576,"sha256":"9fe31df255d17b0339391ff80a71bf2c5d442cc301bd2fe6eeea00b626f10785"},{"path":"C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.26100.0\\ucrt\\x64\\ucrt.lib","bytes":285588,"sha256":"7ef4eac926bf597d2f243f16cdfed7e0db22cb3ca34a1d7e088a84c994a03d66"},{"path":"C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\VC\\Tools\\MSVC\\14.44.35207\\lib\\x64\\msvcrt.lib","bytes":8031888,"sha256":"07670951a39739b6d1b50421ae61707ef23c8dff50cdf35f99408711478f3a7c"},{"path":"C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\VC\\Tools\\MSVC\\14.44.35207\\lib\\x64\\vcruntime.lib","bytes":285940,"sha256":"1acbd98b43a4be8373e25c65dcae4412f36f6111d6b64e47e4a2a97a1d16b27b"},{"path":"C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\VC\\Tools\\MSVC\\14.44.35207\\lib\\x64\\msvcprt.lib","bytes":4050616,"sha256":"59d3ab1065f0a14bd9b27debef4008a91eafbc7411290013f61091bf12dfca0f"}]
+        '@ | ConvertFrom-Json -AsHashtable
+        $explicitLibs = @(foreach ($row in $known) {
+          $actual = MeasureFile $row.path
+          Require ($actual.sha256 -ceq $row.sha256 -and $actual.bytes -eq $row.bytes -and $actual.path -ceq $row.path) 'Previously measured library drift'
+          $actual
+        })
+        $explicitLibs += MeasureFile (Join-Path $msvcLib 'oldnames.lib')
+        Require ($explicitLibs.Count -eq 7) 'Unexpected explicit library count'
+        $linkDir = Join-Path $env:RUNNER_TEMP 'sg-link-inventory'
+        $lr = Get-Content -LiteralPath (Join-Path $linkDir 'link-inventory.json') -Raw | ConvertFrom-Json -AsHashtable
+        Require ($lr.workflow_commit -ceq $env:GITHUB_SHA -and $lr.run_id -ceq $env:GITHUB_RUN_ID -and $lr.run_attempt -ceq '1' -and $lr.mode -ceq 'compile_and_link' -and $lr.native_authorized -eq $false -and $lr.fixture_executed -eq $false) 'Wrong link preflight receipt'
+        Require ($lr.linker_identity_sha256 -ceq $env:SG_LINKER_ID -and $env:SG_LINKER_ID -cmatch '^[0-9a-f]{64}$') 'Unapproved linker identity'
+        $approvedLibPins = [ordered]@{'msvc-libs.tsv'=$env:SG_MSVC_LIB_PIN;'sdk-um-libs.tsv'=$env:SG_UM_LIB_PIN;'sdk-ucrt-libs.tsv'=$env:SG_UCRT_LIB_PIN}
+        foreach ($name in $approvedLibPins.Keys) { Require ($approvedLibPins[$name] -cmatch '^[0-9a-f]{64}$' -and (Get-FileHash -LiteralPath (Join-Path $linkDir $name) -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $approvedLibPins[$name]) 'Unapproved library manifest' }
+        $linkDir = SafeRoot (Join-Path $temp 'sg-link-inventory')
+        Require ($identityHash -ceq $env:SG_LINKER_ID -and $lr.libraries.Count -eq 7) 'Linker or library receipt mismatch'
+        $roots = @($msvcLib,$um,$ucrt)
+        $names = @('msvc-libs.tsv','sdk-um-libs.tsv','sdk-ucrt-libs.tsv')
+        $labels = @('msvc-x64-libraries','sdk-um-x64-libraries','sdk-ucrt-x64-libraries')
+        $base = SafeRoot (Join-Path $temp 'sg-outer-job-compile-only')
+        $work = SafeRoot (Join-Path $base 'work')
+        $receiptDir = SafeRoot (Join-Path $base 'receipt')
+        $compilerTemp = SafeRoot (Join-Path $base 'compiler-temp')
+        $recheck = Join-Path $base 'link-recheck'
+        Require (-not (Test-Path -LiteralPath $recheck)) 'Recheck path exists'
+        $null = New-Item -ItemType Directory -Path $recheck
+        $recheck = SafeRoot $recheck
+        for ($i=0; $i -lt 3; $i++) {
+          $tree = MeasureTree $labels[$i] $roots[$i] (Join-Path $recheck $names[$i])
+          Require ($tree.sha256 -ceq $approvedLibPins[$names[$i]]) 'Library tree changed before link'
+        }
+        function AssertLinkInputs {
+          Require ((MeasureFile (Join-Path $bin 'link.exe')).sha256 -ceq $linker.sha256) 'Linker changed'
+          for ($i=0; $i -lt $explicitLibs.Count; $i++) {
+            $row = $explicitLibs[$i]
+            Require ($row.path -ceq $lr.libraries[$i].path -and $row.sha256 -ceq $lr.libraries[$i].sha256 -and $row.bytes -eq $lr.libraries[$i].bytes -and (MeasureFile $row.path).sha256 -ceq $row.sha256) 'Explicit library changed'
+          }
+        }
+        $compileReceipt = Get-Content -LiteralPath (Join-Path $receiptDir 'compile-receipt.json') -Raw | ConvertFrom-Json -AsHashtable
+        Require ($compileReceipt.workflow_commit -ceq $env:GITHUB_SHA -and $compileReceipt.run_id -ceq $env:GITHUB_RUN_ID -and $compileReceipt.run_attempt -ceq '1' -and $compileReceipt.schema -ceq 'sg-job-membership-compile-only-v1' -and $compileReceipt.diagnostic_executed -eq $false -and $compileReceipt.execution_fingerprint_approved -eq $false -and $compileReceipt.containment_approved -eq $false -and $compileReceipt.native_authorized -eq $false -and $compileReceipt.result -ceq 'OBJECT_ONLY_COMPILED_REVIEW_REQUIRED' -and $compileReceipt.compiler_exit_code -eq 0 -and $compileReceipt.linked -eq $false -and $compileReceipt.fixture_executed -eq $false) 'Wrong same-run compile receipt'
+        $source = Join-Path (SafeRoot (Join-Path $base 'protected')) 'job_membership_probe.cpp'
+        $copy = Join-Path $work 'job_membership_probe.cpp'
+        $obj = Join-Path $work 'job_membership_probe.obj'
+        $exe = Join-Path $work 'job_membership_probe.exe'
+        Require ($compileReceipt.source_sha256 -ceq '2afaba1e01936b67339c46e8c2eb7e8387f9e46a2ac5ebe6b5a3b2e504673321' -and $compileReceipt.disposable_source_sha256 -ceq 'aa2475bfb81acbe1ebfe670009a6f704009fb867b4cf1e219dc7b9f02af4f46a') 'Wrong source receipt'
+        function AssertSourceAndObject {
+          Require ((MeasureFile $source).sha256 -ceq $compileReceipt.source_sha256 -and (MeasureFile $copy).sha256 -ceq $compileReceipt.disposable_source_sha256 -and (MeasureFile $obj).sha256 -ceq $compileReceipt.object_sha256) 'Source or object drift'
+        }
+        Require (-not (Test-Path -LiteralPath $exe) -and @(Get-ChildItem -LiteralPath $work -Force).Count -eq 2) 'Unexpected pre-link workspace'
+        AssertSourceAndObject
+        AssertLinkInputs
+        $windows = SafeRoot 'C:\Windows'
+        $system32 = SafeRoot (Join-Path $windows 'System32')
+        Require ($env:SystemRoot -ieq $windows) 'Windows root mismatch'
+        $psi = [Diagnostics.ProcessStartInfo]::new()
+        $psi.FileName = Join-Path $bin 'link.exe'
+        $psi.WorkingDirectory = $work
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.Environment.Clear()
+        $psi.Environment['SystemRoot'] = $windows
+        $psi.Environment['WINDIR'] = $windows
+        $psi.Environment['SystemDrive'] = 'C:'
+        $psi.Environment['PATH'] = "$bin;$system32"
+        $psi.Environment['TEMP'] = $compilerTemp
+        $psi.Environment['TMP'] = $compilerTemp
+        $arguments = @('/NOLOGO','/MACHINE:X64','/SUBSYSTEM:CONSOLE','/ENTRY:mainCRTStartup','/NODEFAULTLIB','/INCREMENTAL:NO','/MANIFEST:NO','/WX','/NXCOMPAT','/DYNAMICBASE','/HIGHENTROPYVA','/Brepro',"/OUT:$exe",$obj)
+        foreach ($row in $explicitLibs) { $arguments += $row.path }
+        $expectedLinkArguments = @('/NOLOGO','/MACHINE:X64','/SUBSYSTEM:CONSOLE','/ENTRY:mainCRTStartup','/NODEFAULTLIB','/INCREMENTAL:NO','/MANIFEST:NO','/WX','/NXCOMPAT','/DYNAMICBASE','/HIGHENTROPYVA','/Brepro','/OUT:D:\a\_temp\sg-outer-job-compile-only\work\job_membership_probe.exe','D:\a\_temp\sg-outer-job-compile-only\work\job_membership_probe.obj','C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\um\x64\Kernel32.lib','C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\um\x64\Bcrypt.lib','C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\ucrt\x64\ucrt.lib','C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\lib\x64\msvcrt.lib','C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\lib\x64\vcruntime.lib','C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\lib\x64\msvcprt.lib','C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\lib\x64\oldnames.lib')
+        Require ($arguments.Count -eq $expectedLinkArguments.Count) 'Argument count drift; no build'
+        for ($i=0;$i -lt $arguments.Count;$i++) { Require ($arguments[$i] -ceq $expectedLinkArguments[$i]) 'Argument drift; no build' }
+        foreach ($arg in $arguments) { $psi.ArgumentList.Add($arg) }
+        Require (-not $psi.Environment.ContainsKey('LINK') -and -not $psi.Environment.ContainsKey('_LINK_') -and -not $psi.Environment.ContainsKey('LIB') -and -not $psi.Environment.ContainsKey('LIBPATH')) 'Linker environment injection gate'
+        AssertLinkInputs
+        AssertSourceAndObject
+        $process = [Diagnostics.Process]::new()
+        $process.StartInfo = $psi
+        try {
+          Require ($process.Start()) 'Linker start failed'
+          $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+          $stderrTask = $process.StandardError.ReadToEndAsync()
+          if (-not $process.WaitForExit(120000)) { try { $process.Kill($true) } catch { Write-Host 'Linker kill failed; runner teardown required' }; throw 'Link timeout' }
+          Require ($stdoutTask.Wait(5000) -and $stderrTask.Wait(5000)) 'Linker output stream timeout'
+          $stdout = $stdoutTask.Result; $stderr = $stderrTask.Result; $exitCode = $process.ExitCode
+        } finally { $process.Dispose() }
+        $utf8 = [Text.UTF8Encoding]::new($false)
+        [IO.File]::WriteAllText((Join-Path $receiptDir 'linker-diagnostics.txt'),("STDOUT`n$stdout`nSTDERR`n$stderr"),$utf8)
+        Write-Host $stdout; Write-Host $stderr
+        Require ([string]::IsNullOrWhiteSpace($stderr) -and $stdout -notmatch '(?im)\b(?:warning|error)\b') 'Unexpected tool diagnostic'
+        Require ($exitCode -eq 0) 'Linker failed; no successful receipt or fallback'
+        AssertLinkInputs
+        AssertSourceAndObject
+        $files = @(Get-ChildItem -LiteralPath $work -Force)
+        Require ($files.Count -eq 3 -and @($files | Where-Object { $_.PSIsContainer -or (($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or $_.Name -notin @('job_membership_probe.cpp','job_membership_probe.obj','job_membership_probe.exe') }).Count -eq 0) 'Unexpected link output'
+        AssertX64PE $exe
+        $exeRow = MeasureFile $exe
+        Require ($exeRow.bytes -ge 512 -and $exeRow.bytes -le 10485760) 'Executable size outside bounds'
+        $bytes = [IO.File]::ReadAllBytes($exe)
+        $pe = [BitConverter]::ToUInt32($bytes,60)
+        Require ($pe + 96 -le $bytes.Length -and [BitConverter]::ToUInt16($bytes,$pe+24) -eq 0x20b -and ([BitConverter]::ToUInt16($bytes,$pe+22) -band 0x2002) -eq 2 -and [BitConverter]::ToUInt16($bytes,$pe+92) -eq 3 -and [BitConverter]::ToUInt32($bytes,$pe+40) -ne 0) 'Expected executable PE32+ console image, not DLL'
+        Require ((MeasureFile $exe).sha256 -ceq $exeRow.sha256) 'Executable changed during inspection'
+        $result = [ordered]@{schema='sg-job-membership-link-only-v1'; result='LINKED_NOT_EXECUTED_REVIEW_REQUIRED'; workflow_commit=$env:GITHUB_SHA; run_id=$env:GITHUB_RUN_ID; run_attempt=$env:GITHUB_RUN_ATTEMPT; image=$env:ImageVersion; linker=$linker; linker_identity_sha256=$identityHash; approved_library_manifests=$approvedLibPins; libraries=$explicitLibs; compile_receipt_sha256=(MeasureFile (Join-Path $receiptDir 'compile-receipt.json')).sha256; source_sha256=$compileReceipt.source_sha256; disposable_source_sha256=$compileReceipt.disposable_source_sha256; object_sha256=$compileReceipt.object_sha256; arguments=$arguments; linker_exit_code=$exitCode; executable_sha256=$exeRow.sha256; executable_bytes=$exeRow.bytes; executable_exported=$false; fixture_executed=$false; diagnostic_executed=$false; execution_fingerprint_approved=$false; containment_approved=$false; native_authorized=$false; gameplay_acceptance='0/20'; limits='Explicit seven-library allowlist, no default library search; hosted Windows loader/system modules trusted, not independently pinned' }
+        [IO.File]::WriteAllText((Join-Path $receiptDir 'link-receipt.json'),($result | ConvertTo-Json -Depth 12),$utf8)
+        Write-Host "LINKED_NOT_EXECUTED_REVIEW_REQUIRED: $($exeRow.sha256)"
+    - name: Measure PE and COFF metadata only
+      shell: pwsh
+      run: |
+        Set-StrictMode -Version Latest
+        $ErrorActionPreference = 'Stop'
+        function Require([bool]$condition,[string]$message) { if (-not $condition) { throw $message } }
+        function Hash([string]$p) { (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant() }
+        function SafeFile([string]$p) {
+          $f = Get-Item -LiteralPath $p -Force
+          Require (-not $f.PSIsContainer -and (($f.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)) 'Unsafe metadata input'
+          $d = $f.Directory
+          while ($null -ne $d) { Require (($d.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'Unsafe input ancestor'; $d=$d.Parent }
+          Require ($f.Length -ge 1 -and $f.Length -le 10485760) 'Input size outside bounds'
+        }
+        function U16([byte[]]$b,[long]$o) { Require ($o -ge 0 -and $o+2 -le $b.Length) 'Truncated UInt16'; [BitConverter]::ToUInt16($b,[int]$o) }
+        function U32([byte[]]$b,[long]$o) { Require ($o -ge 0 -and $o+4 -le $b.Length) 'Truncated UInt32'; [BitConverter]::ToUInt32($b,[int]$o) }
+        $base = Join-Path $env:RUNNER_TEMP 'sg-outer-job-compile-only'
+        $work = Join-Path $base 'work'; $receipt = Join-Path $base 'receipt'
+        $exe = Join-Path $work 'job_membership_probe.exe'; $obj = Join-Path $work 'job_membership_probe.obj'
+        $source = Join-Path (Join-Path $base 'protected') 'job_membership_probe.cpp'; $copy = Join-Path $work 'job_membership_probe.cpp'
+        $cp=Join-Path $receipt 'compile-receipt.json'; $lp=Join-Path $receipt 'link-receipt.json'
+        foreach ($p in @($exe,$obj,$source,$copy,$cp,$lp)) { SafeFile $p }
+        $c=Get-Content -LiteralPath $cp -Raw | ConvertFrom-Json -AsHashtable
+        $l=Get-Content -LiteralPath $lp -Raw | ConvertFrom-Json -AsHashtable
+        foreach ($r in @($c,$l)) {
+          Require ($r.workflow_commit -ceq $env:GITHUB_SHA -and $r.run_id -ceq $env:GITHUB_RUN_ID -and $r.run_attempt -ceq '1' -and $r.fixture_executed -eq $false -and $r.diagnostic_executed -eq $false -and $r.execution_fingerprint_approved -eq $false -and $r.containment_approved -eq $false -and $r.native_authorized -eq $false -and $r.gameplay_acceptance -ceq '0/20') 'Receipt identity/scope mismatch'
+          Require ($r.source_sha256 -ceq '2afaba1e01936b67339c46e8c2eb7e8387f9e46a2ac5ebe6b5a3b2e504673321' -and $r.disposable_source_sha256 -ceq 'aa2475bfb81acbe1ebfe670009a6f704009fb867b4cf1e219dc7b9f02af4f46a' -and $r.arguments -ccontains '/Brepro') 'Wrong source or arguments'
+        }
+        Require ($c.result -ceq 'OBJECT_ONLY_COMPILED_REVIEW_REQUIRED' -and $l.result -ceq 'LINKED_NOT_EXECUTED_REVIEW_REQUIRED' -and $c.compiler_exit_code -eq 0 -and $l.linker_exit_code -eq 0 -and $c.object_exported -eq $false -and $l.executable_exported -eq $false) 'Build receipt gate'
+        Require ((Hash $cp) -ceq $l.compile_receipt_sha256 -and (Hash $source) -ceq $c.source_sha256 -and (Hash $copy) -ceq $c.disposable_source_sha256) 'Receipt/source drift'
+        $expectedCompileArguments = @('/nologo','/c','/std:c++17','/EHsc','/W4','/WX','/permissive-','/MD','/X','/Y-','/Zc:__cplusplus','/Brepro','/D_WIN32_WINNT=0x0A00','/DWINVER=0x0A00','/IC:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\include','/IC:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\ucrt','/IC:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared','/IC:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um','/FoD:\a\_temp\sg-outer-job-compile-only\work\job_membership_probe.obj','D:\a\_temp\sg-outer-job-compile-only\work\job_membership_probe.cpp')
+        $expectedLinkArguments = @('/NOLOGO','/MACHINE:X64','/SUBSYSTEM:CONSOLE','/ENTRY:mainCRTStartup','/NODEFAULTLIB','/INCREMENTAL:NO','/MANIFEST:NO','/WX','/NXCOMPAT','/DYNAMICBASE','/HIGHENTROPYVA','/Brepro','/OUT:D:\a\_temp\sg-outer-job-compile-only\work\job_membership_probe.exe','D:\a\_temp\sg-outer-job-compile-only\work\job_membership_probe.obj','C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\um\x64\Kernel32.lib','C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\um\x64\Bcrypt.lib','C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\ucrt\x64\ucrt.lib','C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\lib\x64\msvcrt.lib','C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\lib\x64\vcruntime.lib','C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\lib\x64\msvcprt.lib','C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\lib\x64\oldnames.lib')
+        Require ($c.arguments.Count -eq $expectedCompileArguments.Count -and $l.arguments.Count -eq $expectedLinkArguments.Count) 'Argument count drift'
+        for ($i=0;$i -lt $expectedCompileArguments.Count;$i++) { Require ($c.arguments[$i] -ceq $expectedCompileArguments[$i]) 'Compiler argument drift' }
+        for ($i=0;$i -lt $expectedLinkArguments.Count;$i++) { Require ($l.arguments[$i] -ceq $expectedLinkArguments[$i]) 'Linker argument drift' }
+        $b=[IO.File]::ReadAllBytes($exe); $o=[IO.File]::ReadAllBytes($obj)
+        $eh=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($b)).ToLowerInvariant()
+        $oh=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($o)).ToLowerInvariant()
+        Require ($eh -ceq $l.executable_sha256 -and $oh -ceq $c.object_sha256 -and $oh -ceq $l.object_sha256 -and $b.Length -eq $l.executable_bytes -and $o.Length -eq $c.object_bytes) 'Output drift'
+        Require ((U16 $o 0) -eq 0x8664 -and (U16 $o 16) -eq 0) 'Not ordinary x64 COFF'
+        Require ((U16 $b 0) -eq 0x5a4d) 'Missing MZ'
+        $pe=[long](U32 $b 60); Require ($pe -ge 64 -and (U32 $b $pe) -eq 0x4550 -and (U16 $b ($pe+4)) -eq 0x8664) 'Wrong PE identity'
+        $opt=$pe+24; $optlen=U16 $b ($pe+20); $n=U16 $b ($pe+6)
+        Require ($optlen -ge 168 -and $n -ge 1 -and $n -le 96 -and $opt+$optlen+40*$n -le $b.Length -and (U16 $b $opt) -eq 0x20b -and (U32 $b ($opt+108)) -ge 7) 'Malformed PE32+ headers'
+        $debugRva=[long](U32 $b ($opt+160)); $debugSize=[long](U32 $b ($opt+164))
+        Require ($debugRva -gt 0 -and $debugSize -ge 28 -and $debugSize -le 4096 -and $debugSize%28 -eq 0) 'Missing or invalid debug directory'
+        $matches=@(for ($i=0;$i -lt $n;$i++) {
+          $s=$opt+$optlen+40*$i; $va=[long](U32 $b ($s+12)); $rawSize=[long](U32 $b ($s+16)); $raw=[long](U32 $b ($s+20))
+          if ($debugRva -ge $va -and $debugRva+$debugSize -le $va+$rawSize) { $raw+$debugRva-$va }
+        })
+        Require ($matches.Count -eq 1 -and $matches[0] -ge 0 -and $matches[0]+$debugSize -le $b.Length) 'Debug directory not uniquely file-backed'
+        $entries=@(for ($i=0;$i -lt $debugSize/28;$i++) {
+          $d=[long]$matches[0]+28*$i; $type=U32 $b ($d+12); $size=U32 $b ($d+16); $ptr=U32 $b ($d+24)
+          Require ($size -eq 0 -or ($ptr -gt 0 -and [long]$ptr+$size -le $b.Length)) 'Debug payload outside file'
+          if ($type -eq 16 -and $size -ne 0) {
+            Require ($size -ge 5) 'Truncated REPRO hash length or empty hash'
+            $hashLength = U32 $b ([long]$ptr)
+            Require ([long]$hashLength -eq ([long]$size-4)) 'REPRO hash length does not match payload'
+          }
+          [ordered]@{type=$type;timestamp=(U32 $b ($d+4));size=$size}
+        })
+        Require (@($entries | Where-Object {$_.type -eq 16}).Count -eq 1) 'Expected exactly one IMAGE_DEBUG_TYPE_REPRO marker'
+        Require (@($entries | Where-Object {$_.type -eq 2}).Count -eq 0) 'Unexpected CodeView debug path; no PDB workflow approved'
+        Require ((Hash $exe) -ceq $eh -and (Hash $obj) -ceq $oh -and (Hash $cp) -ceq $l.compile_receipt_sha256) 'Changed during measurement'
+        $r=[ordered]@{schema='sg-job-membership-build-measurement-v1';result='DIAGNOSTIC_BUILD_MEASUREMENT_REVIEW_REQUIRED';workflow_commit=$env:GITHUB_SHA;run_id=$env:GITHUB_RUN_ID;run_attempt=$env:GITHUB_RUN_ATTEMPT;actor=$env:GITHUB_ACTOR;triggering_actor=$env:GITHUB_TRIGGERING_ACTOR;source_sha256=$c.source_sha256;disposable_source_sha256=$c.disposable_source_sha256;compile_receipt_sha256=(Hash $cp);link_receipt_sha256=(Hash $lp);object_sha256=$oh;object_bytes=$o.Length;executable_sha256=$eh;executable_bytes=$b.Length;coff_timestamp=(U32 $o 4);pe_timestamp=(U32 $b ($pe+8));debug_entries=$entries;build_root=$env:RUNNER_TEMP;diagnostic_executed=$false;fixture_executed=$false;executable_exported=$false;object_exported=$false;guardian_outside_job_verified=$false;containment_approved=$false;native_authorized=$false;execution_fingerprint_approved=$false;gameplay_acceptance='0/20'}
+        $out=Join-Path $receipt 'diagnostic-build-measurement.json'
+        Require (-not (Test-Path -LiteralPath $out)) 'Receipt already exists'
+        [IO.File]::WriteAllText($out,($r | ConvertTo-Json -Depth 10),[Text.UTF8Encoding]::new($false))
+        Write-Host 'DIAGNOSTIC_BUILD_MEASUREMENT_REVIEW_REQUIRED'
+    - name: Export diagnostic build metadata only
+      uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+      with:
+        name: job-membership-build-metadata-attempt-${{ github.run_attempt }}
+        path: |
+          ${{ runner.temp }}/sg-windows-toolchain-inventory/inventory.json
+          ${{ runner.temp }}/sg-windows-toolchain-inventory/msvc-bin.tsv
+          ${{ runner.temp }}/sg-windows-toolchain-inventory/msvc-headers.tsv
+          ${{ runner.temp }}/sg-windows-toolchain-inventory/sdk-headers.tsv
+          ${{ runner.temp }}/sg-link-inventory/link-inventory.json
+          ${{ runner.temp }}/sg-link-inventory/msvc-libs.tsv
+          ${{ runner.temp }}/sg-link-inventory/sdk-um-libs.tsv
+          ${{ runner.temp }}/sg-link-inventory/sdk-ucrt-libs.tsv
+          ${{ runner.temp }}/sg-outer-job-compile-only/receipt/compile-receipt.json
+          ${{ runner.temp }}/sg-outer-job-compile-only/receipt/compiler-diagnostics.txt
+          ${{ runner.temp }}/sg-outer-job-compile-only/receipt/link-receipt.json
+          ${{ runner.temp }}/sg-outer-job-compile-only/receipt/linker-diagnostics.txt
+          ${{ runner.temp }}/sg-outer-job-compile-only/receipt/diagnostic-build-measurement.json
+        if-no-files-found: error
+        retention-days: 7
+        overwrite: false
