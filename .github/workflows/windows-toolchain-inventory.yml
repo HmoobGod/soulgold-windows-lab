@@ -1,0 +1,212 @@
+name: SoulGold Windows toolchain inventory (metadata only)
+'on':
+  workflow_dispatch: {}
+permissions: {}
+jobs:
+  inventory:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - name: Measure installed toolchain without invoking it
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          function Require([bool]$condition, [string]$message) {
+            if (-not $condition) { throw $message }
+          }
+          function SafeItem([string]$path, [bool]$directory) {
+            $item = Get-Item -LiteralPath $path -Force
+            Require ($item.PSIsContainer -eq $directory) "Wrong item type: $path"
+            Require (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) "Reparse point refused: $path"
+            return $item
+          }
+          function SafeRoot([string]$path) {
+            $full = [IO.Path]::GetFullPath($path)
+            $cursor = $full
+            while ($null -ne $cursor) {
+              $null = SafeItem $cursor $true
+              $parent = [IO.Directory]::GetParent($cursor)
+              if ($null -eq $parent) { break }
+              $cursor = $parent.FullName
+            }
+            return (SafeItem $full $true).FullName
+          }
+          function MeasureFile([string]$path) {
+            $before = SafeItem $path $false
+            $size = $before.Length
+            $stamp = $before.LastWriteTimeUtc.Ticks
+            $hash = (Get-FileHash -LiteralPath $before.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            $after = SafeItem $path $false
+            Require ($after.Length -eq $size -and $after.LastWriteTimeUtc.Ticks -eq $stamp) "File changed during hashing: $path"
+            Require ($hash -cmatch '^[0-9a-f]{64}$') "Invalid hash: $path"
+            return [ordered]@{ path = $after.FullName; bytes = $size; sha256 = $hash }
+          }
+          function AssertX64PE([string]$path) {
+            $stream = [IO.File]::OpenRead($path)
+            try {
+              $reader = [IO.BinaryReader]::new($stream)
+              Require ($stream.Length -ge 64) "Short PE: $path"
+              Require ($reader.ReadUInt16() -eq 0x5A4D) "Missing MZ: $path"
+              $stream.Position = 0x3c
+              $offset = $reader.ReadUInt32()
+              Require ($offset -ge 64 -and [long]$offset + 6 -le $stream.Length) "Invalid PE offset: $path"
+              $stream.Position = $offset
+              Require ($reader.ReadUInt32() -eq 0x4550) "Missing PE signature: $path"
+              Require ($reader.ReadUInt16() -eq 0x8664) "Not x64 PE: $path"
+            } finally { $stream.Dispose() }
+          }
+          function MeasureCritical([string]$path) {
+            $row = MeasureFile $path
+            AssertX64PE $row.path
+            $version = (SafeItem $path $false).VersionInfo
+            $signature = Get-AuthenticodeSignature -LiteralPath $row.path
+            $row['file_version'] = $version.FileVersion
+            $row['product_version'] = $version.ProductVersion
+            $row['file_version_parts'] = @($version.FileMajorPart, $version.FileMinorPart, $version.FileBuildPart, $version.FilePrivatePart)
+            $row['machine'] = 'AMD64'
+            $row['signature_status'] = [string]$signature.Status
+            $row['signature_type'] = [string]$signature.SignatureType
+            $row['signer_subject'] = $null
+            $row['signer_cert_sha256'] = $null
+            $row['timestamp_subject'] = $null
+            $row['timestamp_cert_sha256'] = $null
+            if ($null -ne $signature.SignerCertificate) {
+              $row['signer_subject'] = $signature.SignerCertificate.Subject
+              $row['signer_cert_sha256'] = $signature.SignerCertificate.GetCertHashString([Security.Cryptography.HashAlgorithmName]::SHA256).ToLowerInvariant()
+            }
+            if ($null -ne $signature.TimeStamperCertificate) {
+              $row['timestamp_subject'] = $signature.TimeStamperCertificate.Subject
+              $row['timestamp_cert_sha256'] = $signature.TimeStamperCertificate.GetCertHashString([Security.Cryptography.HashAlgorithmName]::SHA256).ToLowerInvariant()
+            }
+            Require ($row.signature_status -eq 'Valid' -and $null -ne $row.signer_subject -and $row.signer_subject -match '(?:^|,\s*)O=Microsoft Corporation(?:,|$)') "Critical PE signature rejected: $path"
+            Require ($version.FileMajorPart -eq 19 -and $version.FileMinorPart -eq 44) "Critical PE is not version 19.44: $path"
+            Require ((MeasureFile $path).sha256 -ceq $row.sha256) "Critical PE changed during signature inspection: $path"
+            return $row
+          }
+          function MeasureTree([string]$label, [string]$root, [string]$destination) {
+            $root = SafeRoot $root
+            $pending = [Collections.Generic.Stack[string]]::new()
+            $pending.Push($root)
+            $rows = [Collections.Generic.List[string]]::new()
+            $count = 0
+            $dirCount = 0
+            $totalBytes = [long]0
+            while ($pending.Count -gt 0) {
+              $directory = $pending.Pop()
+              $null = SafeItem $directory $true
+              $dirCount++
+              Require ($dirCount -le 100000) "Directory-count bound exceeded: $label"
+              foreach ($item in Get-ChildItem -LiteralPath $directory -Force) {
+                Require (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) "Reparse point refused: $($item.FullName)"
+                if ($item.PSIsContainer) { $pending.Push($item.FullName); continue }
+                $count++
+                Require ($count -le 100000) "File-count bound exceeded: $label"
+                $relative = [IO.Path]::GetRelativePath($root, $item.FullName).Replace('\', '/')
+                Require (-not [IO.Path]::IsPathRooted($relative) -and $relative -notmatch '(^|/)\.\.(/|$)|[\x00-\x1f]') "Invalid relative path: $label"
+                $row = MeasureFile $item.FullName
+                $totalBytes += $row.bytes
+                Require ($totalBytes -le 10737418240) "Byte-count bound exceeded: $label"
+                $rows.Add("$($row.sha256)`t$($row.bytes)`t$relative")
+              }
+            }
+            Require ($count -gt 0) "Empty inventory: $label"
+            [string[]]$lines = $rows.ToArray()
+            [Array]::Sort($lines, [StringComparer]::Ordinal)
+            [IO.File]::WriteAllLines($destination, $lines, [Text.UTF8Encoding]::new($false))
+            return [ordered]@{ label = $label; root = $root; files = $count; bytes = $totalBytes; manifest = [IO.Path]::GetFileName($destination); sha256 = (MeasureFile $destination).sha256 }
+          }
+          Require ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') 'Manual dispatch required'
+          Require ($env:RUNNER_OS -eq 'Windows' -and $env:RUNNER_ARCH -eq 'X64') 'Windows x64 runner required'
+          Require ([Environment]::Is64BitProcess -and [Environment]::OSVersion.Version.Build -eq 20348) 'Expected 64-bit Windows Server 2022 build 20348'
+          Require (-not [string]::IsNullOrWhiteSpace($env:ImageVersion) -and $env:ImageOS -eq 'win22') 'Runner image identity missing or unexpected'
+          Require ($env:GITHUB_SHA -cmatch '^[0-9a-f]{40}$' -and $env:GITHUB_RUN_ID -match '^\d+$' -and $env:GITHUB_RUN_ATTEMPT -match '^\d+$') 'Missing run identity'
+          $temp = SafeRoot $env:RUNNER_TEMP
+          $output = Join-Path $temp 'sg-windows-toolchain-inventory'
+          Require (-not (Test-Path -LiteralPath $output)) 'Output directory already exists'
+          $null = New-Item -ItemType Directory -Path $output
+          $output = SafeRoot $output
+          $vsRoot = SafeRoot 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise'
+          $toolsRoot = SafeRoot (Join-Path $vsRoot 'VC\Tools\MSVC')
+          $candidates = @(Get-ChildItem -LiteralPath $toolsRoot -Directory -Force | Where-Object { $_.Name -cmatch '^14\.44\.\d+$' })
+          Require ($candidates.Count -eq 1) 'Exactly one MSVC 14.44 (v143) installation required; no automatic fallback'
+          $toolset = $candidates[0].Name
+          $msvcRoot = SafeRoot $candidates[0].FullName
+          $bin = SafeRoot (Join-Path $msvcRoot 'bin\Hostx64\x64')
+          $msvcInclude = SafeRoot (Join-Path $msvcRoot 'include')
+          $msvcLib = SafeRoot (Join-Path $msvcRoot 'lib\x64')
+          $sdkRoot = SafeRoot 'C:\Program Files (x86)\Windows Kits\10'
+          $kitsRoot = (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots' -Name KitsRoot10).KitsRoot10
+          Require ((SafeRoot $kitsRoot).TrimEnd('\') -ieq $sdkRoot.TrimEnd('\')) 'SDK registry root mismatch'
+          $sdkVersion = '10.0.26100.0'
+          $sdkInclude = SafeRoot (Join-Path $sdkRoot "Include\$sdkVersion")
+          $sdkUmLib = SafeRoot (Join-Path $sdkRoot "Lib\$sdkVersion\um\x64")
+          $sdkUcrtLib = SafeRoot (Join-Path $sdkRoot "Lib\$sdkVersion\ucrt\x64")
+          $critical = @(foreach ($name in @('cl.exe', 'c1xx.dll', 'c2.dll')) { MeasureCritical (Join-Path $bin $name) })
+          $requiredHeaders = @(foreach ($name in @('array','algorithm','cstdint','cstdio','string','vector','cwchar','cstring')) { MeasureFile (Join-Path $msvcInclude $name) })
+          $sdkHeaderRoots = @(foreach ($name in @('um','shared','ucrt')) { SafeRoot (Join-Path $sdkInclude $name) })
+          foreach ($name in @('windows.h','bcrypt.h')) {
+            $hits = @(foreach ($root in $sdkHeaderRoots) { $p = Join-Path $root $name; if (Test-Path -LiteralPath $p -PathType Leaf) { $p } })
+            Require ($hits.Count -eq 1) "Missing or ambiguous SDK header: $name"
+            $requiredHeaders += MeasureFile $hits[0]
+          }
+          $libraries = @(
+            MeasureFile (Join-Path $sdkUmLib 'Kernel32.lib')
+            MeasureFile (Join-Path $sdkUmLib 'Bcrypt.lib')
+            MeasureFile (Join-Path $sdkUcrtLib 'ucrt.lib')
+            MeasureFile (Join-Path $msvcLib 'msvcrt.lib')
+            MeasureFile (Join-Path $msvcLib 'vcruntime.lib')
+            MeasureFile (Join-Path $msvcLib 'msvcprt.lib')
+          )
+          $trees = @(
+            MeasureTree 'msvc-hostx64-targetx64-bin' $bin (Join-Path $output 'msvc-bin.tsv')
+            MeasureTree 'msvc-headers' $msvcInclude (Join-Path $output 'msvc-headers.tsv')
+            MeasureTree 'sdk-headers' $sdkInclude (Join-Path $output 'sdk-headers.tsv')
+          )
+          foreach ($row in $critical + $requiredHeaders + $libraries) {
+            Require ((MeasureFile $row.path).sha256 -ceq $row.sha256) 'Required input changed after inventory'
+          }
+          $report = [ordered]@{
+            schema = 'sg-windows-toolchain-inventory-v1'
+            result = 'INVENTORY_COLLECTED_REVIEW_REQUIRED'
+            compile_authorized = $false
+            native_authorized = $false
+            image_os = $env:ImageOS
+            image_version = $env:ImageVersion
+            windows_version = [Environment]::OSVersion.Version.ToString()
+            architecture = $env:RUNNER_ARCH
+            workflow_commit = $env:GITHUB_SHA
+            run_id = $env:GITHUB_RUN_ID
+            run_attempt = $env:GITHUB_RUN_ATTEMPT
+            observed_utc = [DateTime]::UtcNow.ToString('o')
+            powershell_version = $PSVersionTable.PSVersion.ToString()
+            visual_studio_root = $vsRoot
+            msvc_toolset = $toolset
+            msvc_root = $msvcRoot
+            sdk_root = $sdkRoot
+            sdk_version = $sdkVersion
+            critical_compiler_files = $critical
+            required_headers = $requiredHeaders
+            required_libraries = $libraries
+            inventories = $trees
+            limits = 'Host observations only; no dependency closure, execution, build, or publisher-independent attestation. Header and library bytes were hashed, not signature-validated.'
+          }
+          $reportPath = Join-Path $output 'inventory.json'
+          [IO.File]::WriteAllText($reportPath, ($report | ConvertTo-Json -Depth 12), [Text.UTF8Encoding]::new($false))
+          $reportHash = (MeasureFile $reportPath).sha256
+          Write-Host "INVENTORY_COLLECTED_REVIEW_REQUIRED: MSVC $toolset; SDK $sdkVersion; image $env:ImageVersion"
+          Write-Host "inventory.json SHA256: $reportHash"
+          foreach ($row in $critical) { Write-Host "$($row.sha256) $($row.path) [$($row.file_version)] [$($row.signature_status)]" }
+          foreach ($row in $trees) { Write-Host "$($row.sha256) $($row.manifest) ($($row.files) files)" }
+      - name: Upload only metadata manifests
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0 (Node 24)
+        with:
+          name: windows-toolchain-inventory-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/sg-windows-toolchain-inventory/inventory.json
+            ${{ runner.temp }}/sg-windows-toolchain-inventory/msvc-bin.tsv
+            ${{ runner.temp }}/sg-windows-toolchain-inventory/msvc-headers.tsv
+            ${{ runner.temp }}/sg-windows-toolchain-inventory/sdk-headers.tsv
+          if-no-files-found: error
+          retention-days: 7
